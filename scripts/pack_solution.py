@@ -52,12 +52,20 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
+    spec_kwargs = {
+        "language": language,
+        "target_hardware": ["cuda"],
+        "entry_point": entry_point,
+    }
+
+    if "destination_passing_style" in build_config:
+        spec_kwargs["destination_passing_style"] = build_config["destination_passing_style"]
+
+    if "binding" in build_config:
+        spec_kwargs["binding"] = build_config["binding"]
+
     # Create build spec
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-    )
+    spec = BuildSpec(**spec_kwargs)
 
     # Pack the solution
     solution = pack_solution_from_files(
