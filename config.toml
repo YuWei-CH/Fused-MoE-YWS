@@ -7,3 +7,4 @@ author = "Self-Driving Kernel"              # Team/author name
 language = "cuda"               # triton | cuda
 entry_point = "kernel.cu::kernel"
 destination_passing_style = false
+binding = "torch"

@@ -26,13 +26,21 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    max_workloads: int = 0,
+) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
@@ -47,6 +55,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -68,6 +79,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
             }
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
                 entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
@@ -76,6 +89,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
+
+            if trace.evaluation.log and trace.evaluation.status.value != "SUCCESS":
+                print(f"\nDetailed log for workload {trace.workload.uuid}:")
+                print(trace.evaluation.log)
 
     return results
 
@@ -101,9 +118,14 @@ def print_results(results: dict):
 
             print()
 
+            if result.get("log") and status != "SUCCESS":
+                print("    log:")
+                for line in result["log"].strip().splitlines():
+                    print(f"      {line}")
+
 
 @app.local_entrypoint()
-def main():
+def main(max_workloads: int = 0):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -115,7 +137,9 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    if max_workloads > 0:
+        print(f"Debug mode: limiting run to {max_workloads} workload(s)")
+    results = run_benchmark.remote(solution, max_workloads=max_workloads)
 
     if not results:
         print("No results returned!")
