@@ -8,4 +8,3 @@ language = "cuda"
 entry_point = "kernel.cu::kernel"
 destination_passing_style = false
 binding = "tvm-ffi"
-dependencies = ["cublas"]
