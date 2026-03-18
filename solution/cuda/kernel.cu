@@ -26,6 +26,14 @@ constexpr int64_t kTopK = 8;
 constexpr int64_t kNumGroups = 8;
 constexpr int64_t kTopKGroups = 4;
 constexpr int64_t kGroupSize = kGlobalExperts / kNumGroups;
+// B200-oriented heuristic tiling: keep stronger row reuse than the 4x64x64 variant while
+// still using a deeper K tile than the original baseline.
+constexpr int kGemm1TileM = 8;
+constexpr int kGemm1TileN = 32;
+constexpr int kGemm1TileK = 64;
+constexpr int kGemm2TileM = 8;
+constexpr int kGemm2TileN = 32;
+constexpr int kGemm2TileK = 64;
 
 #define CHECK_CUDA(expr)                                                                       \
   do {                                                                                         \
@@ -153,48 +161,6 @@ __global__ void dequant_hidden_states_kernel(const __nv_fp8_e4m3* hidden_states,
   a_fp32[idx] = fp8_to_float(hidden_states[idx]) * scale;
 }
 
-// W13: [E_local, 2I, H], scale: [E_local, (2I)/128, H/128]
-__global__ void dequant_gemm1_kernel(const __nv_fp8_e4m3* gemm1_weights,
-                                     const float* gemm1_weights_scale, float* w13_fp32) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t total = kLocalExperts * (2 * kIntermediateSize) * kHiddenSize;
-  if (idx >= total) {
-    return;
-  }
-  int64_t tmp = idx;
-  int64_t hidden = tmp % kHiddenSize;
-  tmp /= kHiddenSize;
-  int64_t out = tmp % (2 * kIntermediateSize);
-  int64_t expert = tmp / (2 * kIntermediateSize);
-  int64_t out_block = out / kBlock;
-  int64_t hidden_block = hidden / kBlock;
-  int64_t scale_idx = (expert * ((2 * kIntermediateSize) / kBlock) + out_block) *
-                          (kHiddenSize / kBlock) +
-                      hidden_block;
-  w13_fp32[idx] = fp8_to_float(gemm1_weights[idx]) * gemm1_weights_scale[scale_idx];
-}
-
-// W2: [E_local, H, I], scale: [E_local, H/128, I/128]
-__global__ void dequant_gemm2_kernel(const __nv_fp8_e4m3* gemm2_weights,
-                                     const float* gemm2_weights_scale, float* w2_fp32) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t total = kLocalExperts * kHiddenSize * kIntermediateSize;
-  if (idx >= total) {
-    return;
-  }
-  int64_t tmp = idx;
-  int64_t intermediate = tmp % kIntermediateSize;
-  tmp /= kIntermediateSize;
-  int64_t hidden = tmp % kHiddenSize;
-  int64_t expert = tmp / kHiddenSize;
-  int64_t hidden_block = hidden / kBlock;
-  int64_t intermediate_block = intermediate / kBlock;
-  int64_t scale_idx = (expert * (kHiddenSize / kBlock) + hidden_block) *
-                          (kIntermediateSize / kBlock) +
-                      intermediate_block;
-  w2_fp32[idx] = fp8_to_float(gemm2_weights[idx]) * gemm2_weights_scale[scale_idx];
-}
-
 // Compute s = sigmoid(logits) and s_with_bias = s + bias.
 __global__ void sigmoid_bias_kernel(const float* routing_logits, const __nv_bfloat16* routing_bias,
                                     float* s, float* s_with_bias, int64_t t) {
@@ -319,20 +285,133 @@ __global__ void gather_rows_kernel(const float* src, const int32_t* token_idx, f
   dst[idx] = src[static_cast<int64_t>(token) * width + col];
 }
 
-// Naive row-major GEMM:
-// A: [m, k], B stored as [n, k], C: [m, n]
-__global__ void naive_gemm_kernel(const float* a, const float* b, float* c, int64_t m, int64_t n,
-                                  int64_t k) {
-  int64_t row = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-  int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (row >= m || col >= n) {
-    return;
-  }
+// GEMM1 specialized for A: [Tk, H], W13: [2I, H] stored as FP8 block-scaled weights.
+// We tile along M/N/K, stage A and on-the-fly dequantized W13 into shared memory, and
+// accumulate in FP32 without materializing the full dequantized W13 tensor.
+__global__ void gemm1_tiled_fused_w13_kernel(const float* __restrict__ a,
+                                             const __nv_fp8_e4m3* __restrict__ w13_fp8,
+                                             const float* __restrict__ w13_scale,
+                                             float* __restrict__ g1, int64_t m) {
+  __shared__ float a_tile[kGemm1TileM][kGemm1TileK];
+  __shared__ float b_tile[kGemm1TileN][kGemm1TileK];
+
+  int local_col = threadIdx.x;
+  int local_row = threadIdx.y;
+  int tid = local_row * blockDim.x + local_col;
+  int row = blockIdx.y * kGemm1TileM + local_row;
+  int col = blockIdx.x * kGemm1TileN + local_col;
+
   float acc = 0.0f;
-  for (int64_t kk = 0; kk < k; ++kk) {
-    acc += a[row * k + kk] * b[col * k + kk];
+
+  for (int64_t k0 = 0; k0 < kHiddenSize; k0 += kGemm1TileK) {
+    for (int idx = tid; idx < kGemm1TileM * kGemm1TileK; idx += blockDim.x * blockDim.y) {
+      int tile_row = idx / kGemm1TileK;
+      int tile_k = idx % kGemm1TileK;
+      int global_row = blockIdx.y * kGemm1TileM + tile_row;
+      int64_t global_k = k0 + tile_k;
+      if (global_row < m && global_k < kHiddenSize) {
+        a_tile[tile_row][tile_k] = a[static_cast<int64_t>(global_row) * kHiddenSize + global_k];
+      } else {
+        a_tile[tile_row][tile_k] = 0.0f;
+      }
+    }
+
+    for (int idx = tid; idx < kGemm1TileN * kGemm1TileK; idx += blockDim.x * blockDim.y) {
+      int tile_col = idx / kGemm1TileK;
+      int tile_k = idx % kGemm1TileK;
+      int global_col = blockIdx.x * kGemm1TileN + tile_col;
+      int64_t global_k = k0 + tile_k;
+      if (global_col < 2 * kIntermediateSize && global_k < kHiddenSize) {
+        int64_t weight_idx =
+            static_cast<int64_t>(global_col) * kHiddenSize + global_k;
+        int64_t scale_idx = static_cast<int64_t>(global_col / kBlock) * (kHiddenSize / kBlock) +
+                            (global_k / kBlock);
+        b_tile[tile_col][tile_k] = fp8_to_float(w13_fp8[weight_idx]) * w13_scale[scale_idx];
+      } else {
+        b_tile[tile_col][tile_k] = 0.0f;
+      }
+    }
+
+    __syncthreads();
+
+    if (row < m && col < 2 * kIntermediateSize) {
+      #pragma unroll
+      for (int kk = 0; kk < kGemm1TileK; ++kk) {
+        acc += a_tile[local_row][kk] * b_tile[local_col][kk];
+      }
+    }
+
+    __syncthreads();
   }
-  c[row * n + col] = acc;
+
+  if (row < m && col < 2 * kIntermediateSize) {
+    g1[static_cast<int64_t>(row) * (2 * kIntermediateSize) + col] = acc;
+  }
+}
+
+// GEMM2 specialized for C: [Tk, I], W2: [H, I] stored as FP8 block-scaled weights.
+// This mirrors GEMM1: tile C and on-the-fly dequantized W2 into shared memory, then
+// accumulate O = C @ W2^T in FP32 without materializing the full dequantized W2 tensor.
+__global__ void gemm2_tiled_fused_w2_kernel(const float* __restrict__ c,
+                                            const __nv_fp8_e4m3* __restrict__ w2_fp8,
+                                            const float* __restrict__ w2_scale,
+                                            float* __restrict__ o, int64_t m) {
+  __shared__ float c_tile[kGemm2TileM][kGemm2TileK];
+  __shared__ float b_tile[kGemm2TileN][kGemm2TileK];
+
+  int local_col = threadIdx.x;
+  int local_row = threadIdx.y;
+  int tid = local_row * blockDim.x + local_col;
+  int row = blockIdx.y * kGemm2TileM + local_row;
+  int col = blockIdx.x * kGemm2TileN + local_col;
+
+  float acc = 0.0f;
+
+  for (int64_t k0 = 0; k0 < kIntermediateSize; k0 += kGemm2TileK) {
+    for (int idx = tid; idx < kGemm2TileM * kGemm2TileK; idx += blockDim.x * blockDim.y) {
+      int tile_row = idx / kGemm2TileK;
+      int tile_k = idx % kGemm2TileK;
+      int global_row = blockIdx.y * kGemm2TileM + tile_row;
+      int64_t global_k = k0 + tile_k;
+      if (global_row < m && global_k < kIntermediateSize) {
+        c_tile[tile_row][tile_k] =
+            c[static_cast<int64_t>(global_row) * kIntermediateSize + global_k];
+      } else {
+        c_tile[tile_row][tile_k] = 0.0f;
+      }
+    }
+
+    for (int idx = tid; idx < kGemm2TileN * kGemm2TileK; idx += blockDim.x * blockDim.y) {
+      int tile_col = idx / kGemm2TileK;
+      int tile_k = idx % kGemm2TileK;
+      int global_col = blockIdx.x * kGemm2TileN + tile_col;
+      int64_t global_k = k0 + tile_k;
+      if (global_col < kHiddenSize && global_k < kIntermediateSize) {
+        int64_t weight_idx = static_cast<int64_t>(global_col) * kIntermediateSize + global_k;
+        int64_t scale_idx = static_cast<int64_t>(global_col / kBlock) *
+                                (kIntermediateSize / kBlock) +
+                            (global_k / kBlock);
+        b_tile[tile_col][tile_k] = fp8_to_float(w2_fp8[weight_idx]) * w2_scale[scale_idx];
+      } else {
+        b_tile[tile_col][tile_k] = 0.0f;
+      }
+    }
+
+    __syncthreads();
+
+    if (row < m && col < kHiddenSize) {
+      #pragma unroll
+      for (int kk = 0; kk < kGemm2TileK; ++kk) {
+        acc += c_tile[local_row][kk] * b_tile[local_col][kk];
+      }
+    }
+
+    __syncthreads();
+  }
+
+  if (row < m && col < kHiddenSize) {
+    o[static_cast<int64_t>(row) * kHiddenSize + col] = acc;
+  }
 }
 
 // Split G1 into X1 and X2, apply SiLU(X2), then multiply by X1.
@@ -431,11 +510,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
 
   // Materialize the same float32 intermediates as the PyTorch reference.
   AsyncBuffer<float> a_fp32(static_cast<size_t>(t) * kHiddenSize, stream);
-  AsyncBuffer<float> w13_fp32(static_cast<size_t>(kLocalExperts) * (2 * kIntermediateSize) *
-                                  kHiddenSize,
-                              stream);
-  AsyncBuffer<float> w2_fp32(static_cast<size_t>(kLocalExperts) * kHiddenSize * kIntermediateSize,
-                             stream);
   AsyncBuffer<float> s(static_cast<size_t>(t) * kGlobalExperts, stream);
   AsyncBuffer<float> s_with_bias(static_cast<size_t>(t) * kGlobalExperts, stream);
   AsyncBuffer<int32_t> topk_idx(static_cast<size_t>(t) * kTopK, stream);
@@ -447,8 +521,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
 
   constexpr int threads_1d = 256;
   int64_t hidden_total = t * kHiddenSize;
-  int64_t gemm1_total = kLocalExperts * (2 * kIntermediateSize) * kHiddenSize;
-  int64_t gemm2_total = kLocalExperts * kHiddenSize * kIntermediateSize;
   int64_t routing_total = t * kGlobalExperts;
 
   // 1) FP8 block-scale dequantization
@@ -456,16 +528,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
                                  stream>>>(
       static_cast<const __nv_fp8_e4m3*>(hidden_states.data_ptr()),
       static_cast<const float*>(hidden_states_scale.data_ptr()), a_fp32.get(), t);
-  CHECK_CUDA(cudaGetLastError());
-
-  dequant_gemm1_kernel<<<(gemm1_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
-      static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
-      static_cast<const float*>(gemm1_weights_scale.data_ptr()), w13_fp32.get());
-  CHECK_CUDA(cudaGetLastError());
-
-  dequant_gemm2_kernel<<<(gemm2_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
-      static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
-      static_cast<const float*>(gemm2_weights_scale.data_ptr()), w2_fp32.get());
   CHECK_CUDA(cudaGetLastError());
 
   // 2) No-aux routing
@@ -498,7 +560,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   }
 
   // 3) Local expert compute and accumulation
-  dim3 block2d(16, 16);
   for (int64_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
     int32_t global_expert = static_cast<int32_t>(local_expert_offset + local_expert);
     if (global_expert < 0 || global_expert >= kGlobalExperts) {
@@ -526,13 +587,17 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
         a_fp32.get(), token_idx_device.get(), a_e.get(), tk, kHiddenSize);
     CHECK_CUDA(cudaGetLastError());
 
-    const float* w13_expert = w13_fp32.get() +
-                              local_expert * static_cast<int64_t>(2 * kIntermediateSize) *
-                                  kHiddenSize;
-    dim3 gemm1_grid((2 * kIntermediateSize + block2d.x - 1) / block2d.x,
-                    (tk + block2d.y - 1) / block2d.y);
-    naive_gemm_kernel<<<gemm1_grid, block2d, 0, stream>>>(a_e.get(), w13_expert, g1.get(), tk,
-                                                           2 * kIntermediateSize, kHiddenSize);
+    const __nv_fp8_e4m3* w13_expert =
+        static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()) +
+        local_expert * static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize;
+    const float* w13_scale_expert =
+        static_cast<const float*>(gemm1_weights_scale.data_ptr()) +
+        local_expert * static_cast<int64_t>(num_gemm1_out_blocks) * num_hidden_blocks;
+    dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
+    dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
+                    (tk + kGemm1TileM - 1) / kGemm1TileM);
+    gemm1_tiled_fused_w13_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
+        a_e.get(), w13_expert, w13_scale_expert, g1.get(), tk);
     CHECK_CUDA(cudaGetLastError());
 
     int64_t swiglu_total = tk * kIntermediateSize;
@@ -540,11 +605,17 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
         g1.get(), c.get(), tk);
     CHECK_CUDA(cudaGetLastError());
 
-    const float* w2_expert = w2_fp32.get() +
-                             local_expert * static_cast<int64_t>(kHiddenSize) * kIntermediateSize;
-    dim3 gemm2_grid((kHiddenSize + block2d.x - 1) / block2d.x, (tk + block2d.y - 1) / block2d.y);
-    naive_gemm_kernel<<<gemm2_grid, block2d, 0, stream>>>(c.get(), w2_expert, o.get(), tk,
-                                                           kHiddenSize, kIntermediateSize);
+    const __nv_fp8_e4m3* w2_expert =
+        static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()) +
+        local_expert * static_cast<int64_t>(kHiddenSize) * kIntermediateSize;
+    const float* w2_scale_expert =
+        static_cast<const float*>(gemm2_weights_scale.data_ptr()) +
+        local_expert * static_cast<int64_t>(num_hidden_blocks) * num_intermediate_blocks;
+    dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
+    dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
+                    (tk + kGemm2TileM - 1) / kGemm2TileM);
+    gemm2_tiled_fused_w2_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
+        c.get(), w2_expert, w2_scale_expert, o.get(), tk);
     CHECK_CUDA(cudaGetLastError());
 
     int64_t scatter_total = tk * kHiddenSize;
