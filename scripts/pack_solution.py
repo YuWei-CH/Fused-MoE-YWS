@@ -64,6 +64,9 @@ def pack_solution(output_path: Path = None) -> Path:
     if "binding" in build_config:
         spec_kwargs["binding"] = build_config["binding"]
 
+    if "dependencies" in build_config:
+        spec_kwargs["dependencies"] = build_config["dependencies"]
+
     # Create build spec
     spec = BuildSpec(**spec_kwargs)
 

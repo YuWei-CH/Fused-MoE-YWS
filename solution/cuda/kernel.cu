@@ -1,6 +1,8 @@
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <tvm/ffi/container/shape.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
@@ -11,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 namespace ffi = tvm::ffi;
@@ -74,6 +77,128 @@ void CheckSameDevice(const ffi::TensorView& a, const ffi::TensorView& b, const c
       a.device().device_id != b.device().device_id) {
     TVM_FFI_THROW(ValueError) << a_name << " and " << b_name << " must be on the same device";
   }
+}
+
+const char* CublasStatusToString(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+    default:
+      return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+#define CHECK_CUBLAS(expr)                                                                    \
+  do {                                                                                        \
+    cublasStatus_t status__ = (expr);                                                         \
+    if (status__ != CUBLAS_STATUS_SUCCESS) {                                                  \
+      TVM_FFI_THROW(RuntimeError) << "cuBLAS error at " << __FILE__ << ":" << __LINE__       \
+                                   << ": " << CublasStatusToString(status__);                \
+    }                                                                                         \
+  } while (0)
+
+struct CublasApi {
+  using CreateFn = cublasStatus_t (*)(cublasHandle_t*);
+  using DestroyFn = cublasStatus_t (*)(cublasHandle_t);
+  using SetStreamFn = cublasStatus_t (*)(cublasHandle_t, cudaStream_t);
+  using SgemmFn = cublasStatus_t (*)(cublasHandle_t, cublasOperation_t, cublasOperation_t, int,
+                                     int, int, const float*, const float*, int, const float*,
+                                     int, const float*, float*, int);
+
+  void* library = nullptr;
+  CreateFn create = nullptr;
+  DestroyFn destroy = nullptr;
+  SetStreamFn set_stream = nullptr;
+  SgemmFn sgemm = nullptr;
+};
+
+const CublasApi& GetCublasApi() {
+  static const CublasApi api = []() {
+    void* handle = dlopen("libcublas.so.12", RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+      handle = dlopen("libcublas.so", RTLD_NOW | RTLD_LOCAL);
+    }
+    if (handle == nullptr) {
+      TVM_FFI_THROW(RuntimeError) << "Failed to load libcublas: " << dlerror();
+    }
+
+    auto load_symbol = [handle](const char* name) -> void* {
+      dlerror();
+      void* symbol = dlsym(handle, name);
+      const char* err = dlerror();
+      if (err != nullptr) {
+        TVM_FFI_THROW(RuntimeError) << "Failed to load cuBLAS symbol '" << name
+                                    << "': " << err;
+      }
+      return symbol;
+    };
+
+    CublasApi api{};
+    api.library = handle;
+    api.create = reinterpret_cast<CublasApi::CreateFn>(load_symbol("cublasCreate_v2"));
+    api.destroy = reinterpret_cast<CublasApi::DestroyFn>(load_symbol("cublasDestroy_v2"));
+    api.set_stream =
+        reinterpret_cast<CublasApi::SetStreamFn>(load_symbol("cublasSetStream_v2"));
+    api.sgemm = reinterpret_cast<CublasApi::SgemmFn>(load_symbol("cublasSgemm_v2"));
+    return api;
+  }();
+  return api;
+}
+
+class CublasHandleGuard {
+ public:
+  explicit CublasHandleGuard(cudaStream_t stream) : api_(GetCublasApi()) {
+    CHECK_CUBLAS(api_.create(&handle_));
+    CHECK_CUBLAS(api_.set_stream(handle_, stream));
+  }
+
+  ~CublasHandleGuard() {
+    if (handle_ != nullptr) {
+      cublasStatus_t status = api_.destroy(handle_);
+      (void)status;
+    }
+  }
+
+  cublasHandle_t get() const { return handle_; }
+
+ private:
+  const CublasApi& api_;
+  cublasHandle_t handle_ = nullptr;
+};
+
+void RunCublasRowMajorABtGemm(cublasHandle_t handle, const float* a, const float* b, float* c,
+                              int64_t m, int64_t n, int64_t k) {
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  const CublasApi& api = GetCublasApi();
+
+  // Row-major C[m, n] = A[m, k] * B[n, k]^T
+  // cuBLAS sees the same buffers as column-major:
+  // C_col[n, m] = op(B_col) * op(A_col) = B_row[n, k] * A_row[m, k]^T
+  // so we swap the operands and call SGEMM with (n, m, k) to produce the
+  // correct row-major output layout in memory.
+  CHECK_CUBLAS(api.sgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(n),
+                         static_cast<int>(m), static_cast<int>(k), &alpha, b,
+                         static_cast<int>(k), a, static_cast<int>(k), &beta, c,
+                         static_cast<int>(n)));
 }
 
 template <typename T>
@@ -320,22 +445,6 @@ __global__ void gather_rows_kernel(const float* src, const int32_t* token_idx, f
   dst[idx] = src[static_cast<int64_t>(token) * width + col];
 }
 
-// Naive row-major GEMM:
-// A: [m, k], B stored as [n, k], C: [m, n]
-__global__ void naive_gemm_kernel(const float* a, const float* b, float* c, int64_t m, int64_t n,
-                                  int64_t k) {
-  int64_t row = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
-  int64_t col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (row >= m || col >= n) {
-    return;
-  }
-  float acc = 0.0f;
-  for (int64_t kk = 0; kk < k; ++kk) {
-    acc += a[row * k + kk] * b[col * k + kk];
-  }
-  c[row * n + col] = acc;
-}
-
 // Split G1 into X1 and X2, apply SiLU(X2), then multiply by X1.
 __global__ void swiglu_kernel(const float* g1, float* c, int64_t rows) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -429,6 +538,7 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   ffi::Shape output_shape({t, kHiddenSize});
   ffi::Tensor output_tensor = ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, output_shape,
                                                         bfloat16_dtype, device);
+  CublasHandleGuard cublas_handle(stream);
 
   // Materialize the same float32 intermediates as the PyTorch reference.
   AsyncBuffer<float> a_fp32(static_cast<size_t>(t) * kHiddenSize, stream);
@@ -499,7 +609,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   }
 
   // 3) Local expert compute and accumulation
-  dim3 block2d(16, 16);
   for (int64_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
     int32_t global_expert = static_cast<int32_t>(local_expert_offset + local_expert);
     if (global_expert < 0 || global_expert >= kGlobalExperts) {
@@ -530,11 +639,8 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
     const float* w13_expert = w13_fp32.get() +
                               local_expert * static_cast<int64_t>(2 * kIntermediateSize) *
                                   kHiddenSize;
-    dim3 gemm1_grid((2 * kIntermediateSize + block2d.x - 1) / block2d.x,
-                    (tk + block2d.y - 1) / block2d.y);
-    naive_gemm_kernel<<<gemm1_grid, block2d, 0, stream>>>(a_e.get(), w13_expert, g1.get(), tk,
-                                                           2 * kIntermediateSize, kHiddenSize);
-    CHECK_CUDA(cudaGetLastError());
+    RunCublasRowMajorABtGemm(cublas_handle.get(), a_e.get(), w13_expert, g1.get(), tk,
+                             2 * kIntermediateSize, kHiddenSize);
 
     int64_t swiglu_total = tk * kIntermediateSize;
     swiglu_kernel<<<(swiglu_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
@@ -543,10 +649,8 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
 
     const float* w2_expert = w2_fp32.get() +
                              local_expert * static_cast<int64_t>(kHiddenSize) * kIntermediateSize;
-    dim3 gemm2_grid((kHiddenSize + block2d.x - 1) / block2d.x, (tk + block2d.y - 1) / block2d.y);
-    naive_gemm_kernel<<<gemm2_grid, block2d, 0, stream>>>(c.get(), w2_expert, o.get(), tk,
-                                                           kHiddenSize, kIntermediateSize);
-    CHECK_CUDA(cudaGetLastError());
+    RunCublasRowMajorABtGemm(cublas_handle.get(), c.get(), w2_expert, o.get(), tk, kHiddenSize,
+                             kIntermediateSize);
 
     int64_t scatter_total = tk * kHiddenSize;
     weighted_scatter_add_kernel<<<(scatter_total + threads_1d - 1) / threads_1d, threads_1d, 0,
