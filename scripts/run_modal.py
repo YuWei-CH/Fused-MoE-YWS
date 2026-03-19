@@ -10,6 +10,7 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -40,10 +41,22 @@ def run_benchmark(
     solution: Solution,
     config: BenchmarkConfig = None,
     max_workloads: int = 0,
+    workload_uuid: str = "",
+    debug_histogram: bool = False,
+    debug_timing: bool = False,
 ) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+
+    if debug_histogram:
+        os.environ["MOE_DEBUG_HISTOGRAM"] = "1"
+    else:
+        os.environ.pop("MOE_DEBUG_HISTOGRAM", None)
+    if debug_timing:
+        os.environ["MOE_DEBUG_TIMING"] = "1"
+    else:
+        os.environ.pop("MOE_DEBUG_TIMING", None)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -58,6 +71,11 @@ def run_benchmark(
 
     if max_workloads > 0:
         workloads = workloads[:max_workloads]
+
+    if workload_uuid:
+        workloads = [workload for workload in workloads if workload.uuid == workload_uuid]
+        if not workloads:
+            raise ValueError(f"Workload '{workload_uuid}' not found for definition '{solution.definition}'")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -125,7 +143,12 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(max_workloads: int = 0):
+def main(
+    max_workloads: int = 0,
+    workload_uuid: str = "",
+    debug_histogram: bool = False,
+    debug_timing: bool = False,
+):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -139,7 +162,22 @@ def main(max_workloads: int = 0):
     print("\nRunning benchmark on Modal B200...")
     if max_workloads > 0:
         print(f"Debug mode: limiting run to {max_workloads} workload(s)")
-    results = run_benchmark.remote(solution, max_workloads=max_workloads)
+    if workload_uuid:
+        print(f"Filtering to workload: {workload_uuid}")
+    if debug_histogram or debug_timing:
+        enabled = []
+        if debug_histogram:
+            enabled.append("histogram")
+        if debug_timing:
+            enabled.append("timing")
+        print(f"Kernel debug enabled: {', '.join(enabled)}")
+    results = run_benchmark.remote(
+        solution,
+        max_workloads=max_workloads,
+        workload_uuid=workload_uuid,
+        debug_histogram=debug_histogram,
+        debug_timing=debug_timing,
+    )
 
     if not results:
         print("No results returned!")

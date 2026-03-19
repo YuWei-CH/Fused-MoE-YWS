@@ -8,8 +8,12 @@
 #include <tvm/ffi/function.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -136,6 +140,257 @@ class AsyncBuffer {
   T* ptr_ = nullptr;
   size_t count_ = 0;
   cudaStream_t stream_ = nullptr;
+};
+
+bool EnvFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+         std::strcmp(value, "False") != 0 && std::strcmp(value, "FALSE") != 0;
+}
+
+struct DebugOptions {
+  bool histogram = false;
+  bool timing = false;
+};
+
+DebugOptions GetDebugOptions() {
+  return {
+      .histogram = EnvFlagEnabled("MOE_DEBUG_HISTOGRAM"),
+      .timing = EnvFlagEnabled("MOE_DEBUG_TIMING"),
+  };
+}
+
+class ScopedCudaTimer {
+ public:
+  ScopedCudaTimer(cudaStream_t stream, float* accum_ms) : stream_(stream), accum_ms_(accum_ms) {
+    if (accum_ms_ == nullptr) {
+      return;
+    }
+    if (cudaEventCreate(&start_) != cudaSuccess) {
+      start_ = nullptr;
+      return;
+    }
+    if (cudaEventCreate(&stop_) != cudaSuccess) {
+      cudaEventDestroy(start_);
+      start_ = nullptr;
+      stop_ = nullptr;
+      return;
+    }
+    if (cudaEventRecord(start_, stream_) != cudaSuccess) {
+      cudaEventDestroy(start_);
+      cudaEventDestroy(stop_);
+      start_ = nullptr;
+      stop_ = nullptr;
+    }
+  }
+
+  ~ScopedCudaTimer() {
+    if (start_ == nullptr || stop_ == nullptr || accum_ms_ == nullptr) {
+      return;
+    }
+    if (cudaEventRecord(stop_, stream_) == cudaSuccess &&
+        cudaEventSynchronize(stop_) == cudaSuccess) {
+      float elapsed_ms = 0.0f;
+      if (cudaEventElapsedTime(&elapsed_ms, start_, stop_) == cudaSuccess) {
+        *accum_ms_ += elapsed_ms;
+      }
+    }
+    cudaEventDestroy(start_);
+    cudaEventDestroy(stop_);
+  }
+
+ private:
+  cudaStream_t stream_ = nullptr;
+  float* accum_ms_ = nullptr;
+  cudaEvent_t start_ = nullptr;
+  cudaEvent_t stop_ = nullptr;
+};
+
+class ScopedHostTimer {
+ public:
+  explicit ScopedHostTimer(double* accum_ms) : accum_ms_(accum_ms) {
+    if (accum_ms_ != nullptr) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  ~ScopedHostTimer() {
+    if (accum_ms_ == nullptr) {
+      return;
+    }
+    auto end = std::chrono::steady_clock::now();
+    *accum_ms_ +=
+        std::chrono::duration<double, std::milli>(end - start_).count();
+  }
+
+ private:
+  double* accum_ms_ = nullptr;
+  std::chrono::steady_clock::time_point start_{};
+};
+
+struct ExpertBucket {
+  size_t begin;
+  size_t end;
+  int64_t rows_per_expert;
+  int64_t min_rows;
+  int64_t max_rows;
+};
+
+std::vector<ExpertBucket> BuildExpertBuckets(const std::vector<int32_t>& active_experts,
+                                             const std::vector<std::vector<int32_t>>& token_lists) {
+  std::vector<ExpertBucket> expert_buckets;
+  constexpr int64_t kMaxBucketExperts = 8;
+  for (size_t begin = 0; begin < active_experts.size();) {
+    int64_t min_tk = static_cast<int64_t>(token_lists[active_experts[begin]].size());
+    int64_t bucket_tk = min_tk;
+    size_t end = begin + 1;
+    int64_t allowed_tk =
+        (min_tk <= 64) ? min_tk : (min_tk + std::max<int64_t>(8, min_tk / 8));
+    while (end < active_experts.size() &&
+           static_cast<int64_t>(end - begin) < kMaxBucketExperts) {
+      int64_t next_tk = static_cast<int64_t>(token_lists[active_experts[end]].size());
+      if (next_tk > allowed_tk) {
+        break;
+      }
+      bucket_tk = next_tk;
+      ++end;
+    }
+    expert_buckets.push_back({begin, end, bucket_tk, min_tk, bucket_tk});
+    begin = end;
+  }
+  return expert_buckets;
+}
+
+void PrintTokenHistogramSummary(int64_t seq_len, int32_t local_expert_offset,
+                                const std::vector<std::vector<int32_t>>& token_lists) {
+  int64_t total_assignments = 0;
+  int64_t min_rows = std::numeric_limits<int64_t>::max();
+  int64_t max_rows = 0;
+  int64_t active_experts = 0;
+  std::vector<std::pair<int64_t, int32_t>> counts;
+  counts.reserve(kLocalExperts);
+  for (int32_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
+    int64_t rows = static_cast<int64_t>(token_lists[local_expert].size());
+    total_assignments += rows;
+    min_rows = std::min(min_rows, rows);
+    max_rows = std::max(max_rows, rows);
+    if (rows > 0) {
+      ++active_experts;
+    }
+    counts.push_back({rows, local_expert});
+  }
+  if (min_rows == std::numeric_limits<int64_t>::max()) {
+    min_rows = 0;
+  }
+  std::sort(counts.begin(), counts.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.first != rhs.first) {
+                return lhs.first > rhs.first;
+              }
+              return lhs.second < rhs.second;
+            });
+
+  std::fprintf(stderr,
+               "[MOE_DEBUG] histogram seq_len=%lld local_offset=%d total_local_assignments=%lld "
+               "active_local_experts=%lld avg_rows=%.2f min_rows=%lld max_rows=%lld\n",
+               static_cast<long long>(seq_len), static_cast<int>(local_expert_offset),
+               static_cast<long long>(total_assignments), static_cast<long long>(active_experts),
+               static_cast<double>(total_assignments) / static_cast<double>(kLocalExperts),
+               static_cast<long long>(min_rows), static_cast<long long>(max_rows));
+  std::fprintf(stderr, "[MOE_DEBUG] local_counts");
+  for (int32_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
+    std::fprintf(stderr, " %d:%lld", static_cast<int>(local_expert_offset + local_expert),
+                 static_cast<long long>(token_lists[local_expert].size()));
+  }
+  std::fprintf(stderr, "\n");
+  std::fprintf(stderr, "[MOE_DEBUG] top_local_experts");
+  for (size_t i = 0; i < std::min<size_t>(5, counts.size()) && counts[i].first > 0; ++i) {
+    std::fprintf(stderr, " %d:%lld",
+                 static_cast<int>(local_expert_offset + counts[i].second),
+                 static_cast<long long>(counts[i].first));
+  }
+  std::fprintf(stderr, "\n");
+}
+
+void PrintBucketSummary(int64_t seq_len, int32_t local_expert_offset,
+                        const std::vector<ExpertBucket>& expert_buckets,
+                        const std::vector<int32_t>& active_experts,
+                        const std::vector<std::vector<int32_t>>& token_lists) {
+  int64_t total_real_rows = 0;
+  int64_t total_bucket_rows = 0;
+  std::fprintf(stderr, "[MOE_DEBUG] bucket_summary seq_len=%lld local_offset=%d buckets=%zu\n",
+               static_cast<long long>(seq_len), static_cast<int>(local_expert_offset),
+               expert_buckets.size());
+  for (size_t bucket_idx = 0; bucket_idx < expert_buckets.size(); ++bucket_idx) {
+    const ExpertBucket& bucket = expert_buckets[bucket_idx];
+    int64_t bucket_experts = static_cast<int64_t>(bucket.end - bucket.begin);
+    int64_t real_rows = 0;
+    std::fprintf(stderr,
+                 "[MOE_DEBUG] bucket[%zu] experts=%lld rows_per_expert=%lld min_rows=%lld "
+                 "max_rows=%lld global_ids=",
+                 bucket_idx, static_cast<long long>(bucket_experts),
+                 static_cast<long long>(bucket.rows_per_expert),
+                 static_cast<long long>(bucket.min_rows),
+                 static_cast<long long>(bucket.max_rows));
+    for (size_t idx = bucket.begin; idx < bucket.end; ++idx) {
+      int32_t local_expert = active_experts[idx];
+      int64_t rows = static_cast<int64_t>(token_lists[local_expert].size());
+      real_rows += rows;
+      std::fprintf(stderr, "%s%d(%lld)", (idx == bucket.begin ? "" : ","),
+                   static_cast<int>(local_expert_offset + local_expert),
+                   static_cast<long long>(rows));
+    }
+    int64_t padded_rows = bucket_experts * bucket.rows_per_expert;
+    int64_t pad_rows = padded_rows - real_rows;
+    total_real_rows += real_rows;
+    total_bucket_rows += padded_rows;
+    std::fprintf(stderr, " pad_rows=%lld\n", static_cast<long long>(pad_rows));
+  }
+  int64_t total_pad_rows = total_bucket_rows - total_real_rows;
+  double pad_ratio =
+      total_real_rows == 0 ? 0.0
+                           : static_cast<double>(total_pad_rows) / static_cast<double>(total_real_rows);
+  std::fprintf(stderr,
+               "[MOE_DEBUG] bucket_totals padded_rows=%lld real_rows=%lld pad_rows=%lld "
+               "pad_ratio=%.4f\n",
+               static_cast<long long>(total_bucket_rows), static_cast<long long>(total_real_rows),
+               static_cast<long long>(total_pad_rows), pad_ratio);
+}
+
+struct DebugTimings {
+  float dequant_ms = 0.0f;
+  float routing_ms = 0.0f;
+  float topk_copy_ms = 0.0f;
+  double token_list_host_ms = 0.0;
+  double bucket_pack_host_ms = 0.0;
+  float bucket_upload_ms = 0.0f;
+  float gather_ms = 0.0f;
+  float gemm1_ms = 0.0f;
+  float swiglu_ms = 0.0f;
+  float gemm2_ms = 0.0f;
+  float scatter_ms = 0.0f;
+  float cast_ms = 0.0f;
+
+  void Print(int64_t seq_len, int32_t local_expert_offset) const {
+    double total_ms = static_cast<double>(dequant_ms) + routing_ms + topk_copy_ms +
+                      token_list_host_ms + bucket_pack_host_ms + bucket_upload_ms + gather_ms +
+                      gemm1_ms + swiglu_ms + gemm2_ms + scatter_ms + cast_ms;
+    std::fprintf(stderr,
+                 "[MOE_DEBUG] timing seq_len=%lld local_offset=%d total_ms=%.3f\n",
+                 static_cast<long long>(seq_len), static_cast<int>(local_expert_offset), total_ms);
+    std::fprintf(stderr,
+                 "[MOE_DEBUG] stages dequant=%.3f routing=%.3f topk_copy=%.3f "
+                 "token_list_host=%.3f bucket_pack_host=%.3f bucket_upload=%.3f "
+                 "gather=%.3f gemm1=%.3f swiglu=%.3f gemm2=%.3f scatter=%.3f cast=%.3f\n",
+                 dequant_ms, routing_ms, topk_copy_ms, token_list_host_ms, bucket_pack_host_ms,
+                 bucket_upload_ms, gather_ms, gemm1_ms, swiglu_ms, gemm2_ms, scatter_ms,
+                 cast_ms);
+    std::fprintf(stderr,
+                 "[MOE_DEBUG] note timing mode synchronizes per stage and perturbs performance\n");
+  }
 };
 
 __device__ inline float fp8_to_float(__nv_fp8_e4m3 value) {
@@ -282,7 +537,11 @@ __global__ void gather_rows_vec4_kernel(const float4* src, const int32_t* token_
   int64_t row = idx / vec_width;
   int64_t col = idx % vec_width;
   int32_t token = token_idx[row];
-  dst[idx] = src[static_cast<int64_t>(token) * vec_width + col];
+  if (token < 0) {
+    dst[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  } else {
+    dst[idx] = src[static_cast<int64_t>(token) * vec_width + col];
+  }
 }
 
 // GEMM1 specialized for A: [Tk, H], W13: [2I, H] stored as FP8 block-scaled weights.
@@ -466,6 +725,9 @@ __global__ void weighted_scatter_add_vec4_kernel(const float4* o, const int32_t*
   int64_t row = idx / vec_width;
   int64_t col = idx % vec_width;
   int32_t token = token_idx[row];
+  if (token < 0) {
+    return;
+  }
   float weight = weights[static_cast<int64_t>(token) * kGlobalExperts + global_expert];
   float4 value = o[idx];
   float4 out = output[static_cast<int64_t>(token) * vec_width + col];
@@ -534,6 +796,25 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   DLDevice device = routing_logits.device();
   cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetStream(device.device_type, device.device_id));
+  DebugOptions debug = GetDebugOptions();
+  DebugTimings timings;
+
+  auto time_cuda = [&](float* accum_ms, auto&& fn) {
+    if (debug.timing) {
+      ScopedCudaTimer timer(stream, accum_ms);
+      fn();
+    } else {
+      fn();
+    }
+  };
+  auto time_host = [&](double* accum_ms, auto&& fn) {
+    if (debug.timing) {
+      ScopedHostTimer timer(accum_ms);
+      fn();
+    } else {
+      fn();
+    }
+  };
 
   ffi::Shape output_shape({t, kHiddenSize});
   ffi::Tensor output_tensor = ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, output_shape,
@@ -556,40 +837,50 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   constexpr int64_t kHiddenVecWidth = kHiddenSize / 4;
 
   // 1) FP8 block-scale dequantization
-  dequant_hidden_states_kernel<<<(hidden_total + threads_1d - 1) / threads_1d, threads_1d, 0,
-                                 stream>>>(
-      static_cast<const __nv_fp8_e4m3*>(hidden_states.data_ptr()),
-      static_cast<const float*>(hidden_states_scale.data_ptr()), a_fp32.get(), t);
-  CHECK_CUDA(cudaGetLastError());
+  time_cuda(&timings.dequant_ms, [&] {
+    dequant_hidden_states_kernel<<<(hidden_total + threads_1d - 1) / threads_1d, threads_1d, 0,
+                                   stream>>>(
+        static_cast<const __nv_fp8_e4m3*>(hidden_states.data_ptr()),
+        static_cast<const float*>(hidden_states_scale.data_ptr()), a_fp32.get(), t);
+    CHECK_CUDA(cudaGetLastError());
+  });
 
   // 2) No-aux routing
-  sigmoid_bias_kernel<<<(routing_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
-      static_cast<const float*>(routing_logits.data_ptr()),
-      static_cast<const __nv_bfloat16*>(routing_bias.data_ptr()), s.get(), s_with_bias.get(), t);
-  CHECK_CUDA(cudaGetLastError());
+  time_cuda(&timings.routing_ms, [&] {
+    sigmoid_bias_kernel<<<(routing_total + threads_1d - 1) / threads_1d, threads_1d, 0,
+                          stream>>>(
+        static_cast<const float*>(routing_logits.data_ptr()),
+        static_cast<const __nv_bfloat16*>(routing_bias.data_ptr()), s.get(),
+        s_with_bias.get(), t);
+    CHECK_CUDA(cudaGetLastError());
 
-  routing_select_kernel<<<t, 1, 0, stream>>>(s.get(), s_with_bias.get(), topk_idx.get(),
-                                              weights.get(), t, routed_scaling_factor);
-  CHECK_CUDA(cudaGetLastError());
+    routing_select_kernel<<<t, 1, 0, stream>>>(s.get(), s_with_bias.get(), topk_idx.get(),
+                                                weights.get(), t, routed_scaling_factor);
+    CHECK_CUDA(cudaGetLastError());
+  });
 
   std::vector<int32_t> host_topk(static_cast<size_t>(t) * kTopK);
-  CHECK_CUDA(cudaMemcpyAsync(host_topk.data(), topk_idx.get(),
-                             sizeof(int32_t) * static_cast<size_t>(t) * kTopK,
-                             cudaMemcpyDeviceToHost, stream));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  time_cuda(&timings.topk_copy_ms, [&] {
+    CHECK_CUDA(cudaMemcpyAsync(host_topk.data(), topk_idx.get(),
+                               sizeof(int32_t) * static_cast<size_t>(t) * kTopK,
+                               cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+  });
 
   // Build the per-local-expert token lists on the host, mirroring the reference's
   // per-expert nonzero/index_select flow.
   std::vector<std::vector<int32_t>> token_lists(kLocalExperts);
-  for (int64_t token = 0; token < t; ++token) {
-    for (int64_t k = 0; k < kTopK; ++k) {
-      int32_t global_expert = host_topk[static_cast<size_t>(token) * kTopK + k];
-      int64_t local_expert = static_cast<int64_t>(global_expert) - local_expert_offset;
-      if (0 <= local_expert && local_expert < kLocalExperts) {
-        token_lists[local_expert].push_back(static_cast<int32_t>(token));
+  time_host(&timings.token_list_host_ms, [&] {
+    for (int64_t token = 0; token < t; ++token) {
+      for (int64_t k = 0; k < kTopK; ++k) {
+        int32_t global_expert = host_topk[static_cast<size_t>(token) * kTopK + k];
+        int64_t local_expert = static_cast<int64_t>(global_expert) - local_expert_offset;
+        if (0 <= local_expert && local_expert < kLocalExperts) {
+          token_lists[local_expert].push_back(static_cast<int32_t>(token));
+        }
       }
     }
-  }
+  });
 
   std::vector<int32_t> active_experts;
   for (int32_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
@@ -597,24 +888,24 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
       active_experts.push_back(local_expert);
     }
   }
+
   std::sort(active_experts.begin(), active_experts.end(),
             [&token_lists](int32_t lhs, int32_t rhs) {
               return token_lists[lhs].size() < token_lists[rhs].size();
             });
+  std::vector<ExpertBucket> expert_buckets = BuildExpertBuckets(active_experts, token_lists);
+  if (debug.histogram) {
+    PrintTokenHistogramSummary(t, local_expert_offset, token_lists);
+    PrintBucketSummary(t, local_expert_offset, expert_buckets, active_experts, token_lists);
+  }
 
   int64_t max_bucket_rows = 0;
   int64_t max_bucket_experts = 0;
-  for (size_t begin = 0; begin < active_experts.size();) {
-    int64_t tk = static_cast<int64_t>(token_lists[active_experts[begin]].size());
-    size_t end = begin;
-    while (end < active_experts.size() &&
-           static_cast<int64_t>(token_lists[active_experts[end]].size()) == tk) {
-      ++end;
-    }
-    int64_t bucket_experts = static_cast<int64_t>(end - begin);
-    max_bucket_rows = std::max(max_bucket_rows, bucket_experts * tk);
+  for (const ExpertBucket& bucket : expert_buckets) {
+    int64_t bucket_experts = static_cast<int64_t>(bucket.end - bucket.begin);
+    max_bucket_rows =
+        std::max(max_bucket_rows, bucket_experts * bucket.rows_per_expert);
     max_bucket_experts = std::max(max_bucket_experts, bucket_experts);
-    begin = end;
   }
 
   AsyncBuffer<int32_t> bucket_token_idx_device(max_bucket_rows, stream);
@@ -624,83 +915,100 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
   AsyncBuffer<float> c(static_cast<size_t>(max_bucket_rows) * kIntermediateSize, stream);
   AsyncBuffer<float> o(static_cast<size_t>(max_bucket_rows) * kHiddenSize, stream);
 
-  // 3) Local expert compute and accumulation, grouped by exact token count.
-  for (size_t begin = 0; begin < active_experts.size();) {
-    int64_t tk = static_cast<int64_t>(token_lists[active_experts[begin]].size());
-    size_t end = begin;
-    while (end < active_experts.size() &&
-           static_cast<int64_t>(token_lists[active_experts[end]].size()) == tk) {
-      ++end;
-    }
+  // 3) Local expert compute and accumulation, grouped by bounded-padding buckets.
+  for (const ExpertBucket& bucket : expert_buckets) {
+    int64_t bucket_tk = bucket.rows_per_expert;
+    int64_t bucket_experts = static_cast<int64_t>(bucket.end - bucket.begin);
+    int64_t bucket_rows = bucket_experts * bucket_tk;
+    std::vector<int32_t> host_bucket_expert_ids;
+    std::vector<int32_t> host_bucket_tokens;
+    time_host(&timings.bucket_pack_host_ms, [&] {
+      host_bucket_expert_ids.resize(static_cast<size_t>(bucket_experts));
+      host_bucket_tokens.assign(static_cast<size_t>(bucket_rows), -1);
+      for (int64_t i = 0; i < bucket_experts; ++i) {
+        int32_t local_expert = active_experts[bucket.begin + static_cast<size_t>(i)];
+        host_bucket_expert_ids[static_cast<size_t>(i)] = local_expert;
+        const std::vector<int32_t>& tokens = token_lists[local_expert];
+        std::copy(tokens.begin(), tokens.end(),
+                  host_bucket_tokens.begin() + static_cast<size_t>(i * bucket_tk));
+      }
+    });
 
-    int64_t bucket_experts = static_cast<int64_t>(end - begin);
-    int64_t bucket_rows = bucket_experts * tk;
-    std::vector<int32_t> host_bucket_expert_ids(static_cast<size_t>(bucket_experts));
-    std::vector<int32_t> host_bucket_tokens(static_cast<size_t>(bucket_rows));
-    for (int64_t i = 0; i < bucket_experts; ++i) {
-      int32_t local_expert = active_experts[begin + static_cast<size_t>(i)];
-      host_bucket_expert_ids[static_cast<size_t>(i)] = local_expert;
-      const std::vector<int32_t>& tokens = token_lists[local_expert];
-      std::copy(tokens.begin(), tokens.end(),
-                host_bucket_tokens.begin() + static_cast<size_t>(i * tk));
-    }
-
-    CHECK_CUDA(cudaMemcpyAsync(bucket_expert_ids_device.get(), host_bucket_expert_ids.data(),
-                               sizeof(int32_t) * bucket_experts, cudaMemcpyHostToDevice, stream));
-    CHECK_CUDA(cudaMemcpyAsync(bucket_token_idx_device.get(), host_bucket_tokens.data(),
-                               sizeof(int32_t) * bucket_rows, cudaMemcpyHostToDevice, stream));
+    time_cuda(&timings.bucket_upload_ms, [&] {
+      CHECK_CUDA(cudaMemcpyAsync(bucket_expert_ids_device.get(), host_bucket_expert_ids.data(),
+                                 sizeof(int32_t) * bucket_experts, cudaMemcpyHostToDevice,
+                                 stream));
+      CHECK_CUDA(cudaMemcpyAsync(bucket_token_idx_device.get(), host_bucket_tokens.data(),
+                                 sizeof(int32_t) * bucket_rows, cudaMemcpyHostToDevice, stream));
+    });
 
     int64_t gather_total = bucket_rows * kHiddenVecWidth;
-    gather_rows_vec4_kernel<<<(gather_total + threads_1d - 1) / threads_1d, threads_1d, 0,
-                              stream>>>(
-        reinterpret_cast<const float4*>(a_fp32.get()), bucket_token_idx_device.get(),
-        reinterpret_cast<float4*>(a_e.get()), bucket_rows, kHiddenVecWidth);
-    CHECK_CUDA(cudaGetLastError());
+    time_cuda(&timings.gather_ms, [&] {
+      gather_rows_vec4_kernel<<<(gather_total + threads_1d - 1) / threads_1d, threads_1d, 0,
+                                stream>>>(
+          reinterpret_cast<const float4*>(a_fp32.get()), bucket_token_idx_device.get(),
+          reinterpret_cast<float4*>(a_e.get()), bucket_rows, kHiddenVecWidth);
+      CHECK_CUDA(cudaGetLastError());
+    });
 
     dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
     dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
-                    (tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
-    gemm1_tiled_fused_w13_grouped_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
-        a_e.get(), bucket_expert_ids_device.get(),
-        static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
-        static_cast<const float*>(gemm1_weights_scale.data_ptr()), g1.get(), tk);
-    CHECK_CUDA(cudaGetLastError());
+                    (bucket_tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
+    time_cuda(&timings.gemm1_ms, [&] {
+      gemm1_tiled_fused_w13_grouped_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
+          a_e.get(), bucket_expert_ids_device.get(),
+          static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
+          static_cast<const float*>(gemm1_weights_scale.data_ptr()), g1.get(), bucket_tk);
+      CHECK_CUDA(cudaGetLastError());
+    });
 
     int64_t swiglu_total = bucket_rows * kIntermediateSize;
-    swiglu_grouped_kernel<<<(swiglu_total + threads_1d - 1) / threads_1d, threads_1d, 0,
-                            stream>>>(g1.get(), c.get(), tk, bucket_experts);
-    CHECK_CUDA(cudaGetLastError());
+    time_cuda(&timings.swiglu_ms, [&] {
+      swiglu_grouped_kernel<<<(swiglu_total + threads_1d - 1) / threads_1d, threads_1d, 0,
+                              stream>>>(g1.get(), c.get(), bucket_tk, bucket_experts);
+      CHECK_CUDA(cudaGetLastError());
+    });
 
     dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
     dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
-                    (tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
-    gemm2_tiled_fused_w2_grouped_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
-        c.get(), bucket_expert_ids_device.get(),
-        static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
-        static_cast<const float*>(gemm2_weights_scale.data_ptr()), o.get(), tk);
-    CHECK_CUDA(cudaGetLastError());
-
-    int64_t scatter_total = tk * kHiddenVecWidth;
-    for (int64_t i = 0; i < bucket_experts; ++i) {
-      int32_t global_expert = local_expert_offset + host_bucket_expert_ids[static_cast<size_t>(i)];
-      const float4* o_expert =
-          reinterpret_cast<const float4*>(o.get()) + static_cast<int64_t>(i) * tk * kHiddenVecWidth;
-      const int32_t* token_idx_expert = bucket_token_idx_device.get() + static_cast<int64_t>(i) * tk;
-      weighted_scatter_add_vec4_kernel<<<(scatter_total + threads_1d - 1) / threads_1d,
-                                         threads_1d, 0, stream>>>(
-          o_expert, token_idx_expert, weights.get(), reinterpret_cast<float4*>(output_fp32.get()),
-          tk, global_expert, kHiddenVecWidth);
+                    (bucket_tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
+    time_cuda(&timings.gemm2_ms, [&] {
+      gemm2_tiled_fused_w2_grouped_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
+          c.get(), bucket_expert_ids_device.get(),
+          static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
+          static_cast<const float*>(gemm2_weights_scale.data_ptr()), o.get(), bucket_tk);
       CHECK_CUDA(cudaGetLastError());
-    }
+    });
 
-    begin = end;
+    int64_t scatter_total = bucket_tk * kHiddenVecWidth;
+    time_cuda(&timings.scatter_ms, [&] {
+      for (int64_t i = 0; i < bucket_experts; ++i) {
+        int32_t global_expert =
+            local_expert_offset + host_bucket_expert_ids[static_cast<size_t>(i)];
+        const float4* o_expert = reinterpret_cast<const float4*>(o.get()) +
+                                 static_cast<int64_t>(i) * bucket_tk * kHiddenVecWidth;
+        const int32_t* token_idx_expert =
+            bucket_token_idx_device.get() + static_cast<int64_t>(i) * bucket_tk;
+        weighted_scatter_add_vec4_kernel<<<(scatter_total + threads_1d - 1) / threads_1d,
+                                           threads_1d, 0, stream>>>(
+            o_expert, token_idx_expert, weights.get(),
+            reinterpret_cast<float4*>(output_fp32.get()), bucket_tk, global_expert,
+            kHiddenVecWidth);
+        CHECK_CUDA(cudaGetLastError());
+      }
+    });
   }
 
   int64_t output_total = t * kHiddenSize;
-  cast_output_kernel<<<(output_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
-      output_fp32.get(), static_cast<__nv_bfloat16*>(output_tensor.data_ptr()), output_total);
-  CHECK_CUDA(cudaGetLastError());
+  time_cuda(&timings.cast_ms, [&] {
+    cast_output_kernel<<<(output_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
+        output_fp32.get(), static_cast<__nv_bfloat16*>(output_tensor.data_ptr()), output_total);
+    CHECK_CUDA(cudaGetLastError());
+  });
   CHECK_CUDA(cudaStreamSynchronize(stream));
+  if (debug.timing) {
+    timings.Print(t, local_expert_offset);
+  }
 
   return output_tensor;
 }
