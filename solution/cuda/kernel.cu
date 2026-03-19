@@ -559,6 +559,19 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
     }
   }
 
+  int64_t max_tk = 0;
+  for (const auto& tokens : token_lists) {
+    if (static_cast<int64_t>(tokens.size()) > max_tk) {
+      max_tk = static_cast<int64_t>(tokens.size());
+    }
+  }
+
+  AsyncBuffer<int32_t> token_idx_device(max_tk, stream);
+  AsyncBuffer<float> a_e(static_cast<size_t>(max_tk) * kHiddenSize, stream);
+  AsyncBuffer<float> g1(static_cast<size_t>(max_tk) * (2 * kIntermediateSize), stream);
+  AsyncBuffer<float> c(static_cast<size_t>(max_tk) * kIntermediateSize, stream);
+  AsyncBuffer<float> o(static_cast<size_t>(max_tk) * kHiddenSize, stream);
+
   // 3) Local expert compute and accumulation
   for (int64_t local_expert = 0; local_expert < kLocalExperts; ++local_expert) {
     int32_t global_expert = static_cast<int32_t>(local_expert_offset + local_expert);
@@ -573,12 +586,6 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
 
     // Gather inputs for this expert, then run GEMM1 -> SwiGLU -> GEMM2.
     int64_t tk = static_cast<int64_t>(tokens.size());
-    AsyncBuffer<int32_t> token_idx_device(tk, stream);
-    AsyncBuffer<float> a_e(static_cast<size_t>(tk) * kHiddenSize, stream);
-    AsyncBuffer<float> g1(static_cast<size_t>(tk) * (2 * kIntermediateSize), stream);
-    AsyncBuffer<float> c(static_cast<size_t>(tk) * kIntermediateSize, stream);
-    AsyncBuffer<float> o(static_cast<size_t>(tk) * kHiddenSize, stream);
-
     CHECK_CUDA(cudaMemcpyAsync(token_idx_device.get(), tokens.data(), sizeof(int32_t) * tk,
                                cudaMemcpyHostToDevice, stream));
 
