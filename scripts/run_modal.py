@@ -46,8 +46,20 @@ def run_benchmark(
     debug_timing: bool = False,
 ) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    debug_mode = debug_histogram or debug_timing
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        if debug_mode:
+            config = BenchmarkConfig(warmup_runs=0, iterations=1, num_trials=1)
+        else:
+            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+
+    def get_workload_uuid(item) -> str | None:
+        if hasattr(item, "uuid"):
+            return item.uuid
+        workload = getattr(item, "workload", None)
+        if workload is not None and hasattr(workload, "uuid"):
+            return workload.uuid
+        return None
 
     if debug_histogram:
         os.environ["MOE_DEBUG_HISTOGRAM"] = "1"
@@ -69,13 +81,13 @@ def run_benchmark(
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    if max_workloads > 0:
-        workloads = workloads[:max_workloads]
-
     if workload_uuid:
-        workloads = [workload for workload in workloads if workload.uuid == workload_uuid]
+        workloads = [workload for workload in workloads if get_workload_uuid(workload) == workload_uuid]
         if not workloads:
             raise ValueError(f"Workload '{workload_uuid}' not found for definition '{solution.definition}'")
+
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -171,6 +183,7 @@ def main(
         if debug_timing:
             enabled.append("timing")
         print(f"Kernel debug enabled: {', '.join(enabled)}")
+        print("Using reduced benchmark config for diagnostics: warmup=0, iterations=1, trials=1")
     results = run_benchmark.remote(
         solution,
         max_workloads=max_workloads,

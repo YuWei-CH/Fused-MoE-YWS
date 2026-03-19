@@ -163,6 +163,14 @@ DebugOptions GetDebugOptions() {
   };
 }
 
+bool ShouldPrintDebugOnce(bool enabled, bool* printed_flag) {
+  if (!enabled || printed_flag == nullptr || *printed_flag) {
+    return false;
+  }
+  *printed_flag = true;
+  return true;
+}
+
 class ScopedCudaTimer {
  public:
   ScopedCudaTimer(cudaStream_t stream, float* accum_ms) : stream_(stream), accum_ms_(accum_ms) {
@@ -313,6 +321,7 @@ void PrintTokenHistogramSummary(int64_t seq_len, int32_t local_expert_offset,
                  static_cast<long long>(counts[i].first));
   }
   std::fprintf(stderr, "\n");
+  std::fflush(stderr);
 }
 
 void PrintBucketSummary(int64_t seq_len, int32_t local_expert_offset,
@@ -358,6 +367,7 @@ void PrintBucketSummary(int64_t seq_len, int32_t local_expert_offset,
                "pad_ratio=%.4f\n",
                static_cast<long long>(total_bucket_rows), static_cast<long long>(total_real_rows),
                static_cast<long long>(total_pad_rows), pad_ratio);
+  std::fflush(stderr);
 }
 
 struct DebugTimings {
@@ -390,6 +400,7 @@ struct DebugTimings {
                  cast_ms);
     std::fprintf(stderr,
                  "[MOE_DEBUG] note timing mode synchronizes per stage and perturbs performance\n");
+    std::fflush(stderr);
   }
 };
 
@@ -798,6 +809,8 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
       TVMFFIEnvGetStream(device.device_type, device.device_id));
   DebugOptions debug = GetDebugOptions();
   DebugTimings timings;
+  static bool histogram_printed = false;
+  static bool timing_printed = false;
 
   auto time_cuda = [&](float* accum_ms, auto&& fn) {
     if (debug.timing) {
@@ -894,7 +907,7 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
               return token_lists[lhs].size() < token_lists[rhs].size();
             });
   std::vector<ExpertBucket> expert_buckets = BuildExpertBuckets(active_experts, token_lists);
-  if (debug.histogram) {
+  if (ShouldPrintDebugOnce(debug.histogram, &histogram_printed)) {
     PrintTokenHistogramSummary(t, local_expert_offset, token_lists);
     PrintBucketSummary(t, local_expert_offset, expert_buckets, active_experts, token_lists);
   }
@@ -1006,7 +1019,7 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
     CHECK_CUDA(cudaGetLastError());
   });
   CHECK_CUDA(cudaStreamSynchronize(stream));
-  if (debug.timing) {
+  if (ShouldPrintDebugOnce(debug.timing, &timing_printed)) {
     timings.Print(t, local_expert_offset);
   }
 
