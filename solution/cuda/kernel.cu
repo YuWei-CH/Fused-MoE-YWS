@@ -563,7 +563,10 @@ __global__ void gemm1_tiled_fused_w13_grouped_kernel(
     const __nv_fp8_e4m3* __restrict__ gemm1_weights, const float* __restrict__ gemm1_weights_scale,
     float* __restrict__ g1, int64_t rows_per_expert) {
   __shared__ float a_tile[kGemm1TileM][kGemm1TileK];
-  __shared__ float b_tile[kGemm1TileN][kGemm1TileK];
+  // Store B as [K][N+1] in shared memory. The +1 padding breaks 32-bank aliasing for both:
+  // 1) load phase: warp writes fixed tile_col, varying tile_k
+  // 2) compute phase: warp reads fixed kk, varying local_col
+  __shared__ float b_tile[kGemm1TileK][kGemm1TileN + 1];
 
   int batch_expert = blockIdx.z;
   int32_t local_expert = local_expert_ids[batch_expert];
@@ -608,9 +611,9 @@ __global__ void gemm1_tiled_fused_w13_grouped_kernel(
             static_cast<int64_t>(global_col) * kHiddenSize + global_k;
         int64_t scale_idx = static_cast<int64_t>(global_col / kBlock) * (kHiddenSize / kBlock) +
                             (global_k / kBlock);
-        b_tile[tile_col][tile_k] = fp8_to_float(w13_fp8[weight_idx]) * w13_scale[scale_idx];
+        b_tile[tile_k][tile_col] = fp8_to_float(w13_fp8[weight_idx]) * w13_scale[scale_idx];
       } else {
-        b_tile[tile_col][tile_k] = 0.0f;
+        b_tile[tile_k][tile_col] = 0.0f;
       }
     }
 
@@ -619,7 +622,7 @@ __global__ void gemm1_tiled_fused_w13_grouped_kernel(
     if (row < rows_per_expert && col < 2 * kIntermediateSize) {
       #pragma unroll
       for (int kk = 0; kk < kGemm1TileK; ++kk) {
-        acc += a_tile[local_row][kk] * b_tile[local_col][kk];
+        acc += a_tile[local_row][kk] * b_tile[kk][local_col];
       }
     }
 
@@ -639,7 +642,7 @@ __global__ void gemm2_tiled_fused_w2_grouped_kernel(
     const __nv_fp8_e4m3* __restrict__ gemm2_weights, const float* __restrict__ gemm2_weights_scale,
     float* __restrict__ o, int64_t rows_per_expert) {
   __shared__ float c_tile[kGemm2TileM][kGemm2TileK];
-  __shared__ float b_tile[kGemm2TileN][kGemm2TileK];
+  __shared__ float b_tile[kGemm2TileK][kGemm2TileN + 1];
 
   int batch_expert = blockIdx.z;
   int32_t local_expert = local_expert_ids[batch_expert];
@@ -684,9 +687,9 @@ __global__ void gemm2_tiled_fused_w2_grouped_kernel(
         int64_t scale_idx = static_cast<int64_t>(global_col / kBlock) *
                                 (kIntermediateSize / kBlock) +
                             (global_k / kBlock);
-        b_tile[tile_col][tile_k] = fp8_to_float(w2_fp8[weight_idx]) * w2_scale[scale_idx];
+        b_tile[tile_k][tile_col] = fp8_to_float(w2_fp8[weight_idx]) * w2_scale[scale_idx];
       } else {
-        b_tile[tile_col][tile_k] = 0.0f;
+        b_tile[tile_k][tile_col] = 0.0f;
       }
     }
 
@@ -695,7 +698,7 @@ __global__ void gemm2_tiled_fused_w2_grouped_kernel(
     if (row < rows_per_expert && col < kHiddenSize) {
       #pragma unroll
       for (int kk = 0; kk < kGemm2TileK; ++kk) {
-        acc += c_tile[local_row][kk] * b_tile[local_col][kk];
+        acc += c_tile[local_row][kk] * b_tile[kk][local_col];
       }
     }
 
@@ -964,10 +967,10 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
       CHECK_CUDA(cudaGetLastError());
     });
 
-    dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
-    dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
-                    (bucket_tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
     time_cuda(&timings.gemm1_ms, [&] {
+      dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
+      dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
+                      (bucket_tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
       gemm1_tiled_fused_w13_grouped_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
           a_e.get(), bucket_expert_ids_device.get(),
           static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
@@ -982,10 +985,10 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
       CHECK_CUDA(cudaGetLastError());
     });
 
-    dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
-    dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
-                    (bucket_tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
     time_cuda(&timings.gemm2_ms, [&] {
+      dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
+      dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
+                      (bucket_tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
       gemm2_tiled_fused_w2_grouped_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
           c.get(), bucket_expert_ids_device.get(),
           static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
