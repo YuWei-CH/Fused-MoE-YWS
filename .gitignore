@@ -1,5 +1,6 @@
 # FlashInfer Competition
 solution.json
+artifacts/tile_sweeps/
 
 # CUDA build artifacts
 *.o

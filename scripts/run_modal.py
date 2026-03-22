@@ -10,6 +10,7 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -160,6 +161,7 @@ def main(
     workload_uuid: str = "",
     debug_histogram: bool = False,
     debug_timing: bool = False,
+    json_out: str = "",
 ):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
@@ -197,3 +199,8 @@ def main(
         return
 
     print_results(results)
+    if json_out:
+        output_path = Path(json_out)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(results, indent=2))
+        print(f"\nSaved JSON results to: {output_path}")

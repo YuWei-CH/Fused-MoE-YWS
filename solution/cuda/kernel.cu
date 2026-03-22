@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include "tile_config.h"
 #include <tvm/ffi/container/shape.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
@@ -33,12 +34,12 @@ constexpr int64_t kTopKGroups = 4;
 constexpr int64_t kGroupSize = kGlobalExperts / kNumGroups;
 // B200-oriented heuristic tiling: keep stronger row reuse than the 4x64x64 variant while
 // still using a deeper K tile than the original baseline.
-constexpr int kGemm1TileM = 8;
-constexpr int kGemm1TileN = 32;
-constexpr int kGemm1TileK = 64;
-constexpr int kGemm2TileM = 8;
-constexpr int kGemm2TileN = 32;
-constexpr int kGemm2TileK = 64;
+constexpr int kGemm1TileM = tile_config::kGemm1TileM;
+constexpr int kGemm1TileN = tile_config::kGemm1TileN;
+constexpr int kGemm1TileK = tile_config::kGemm1TileK;
+constexpr int kGemm2TileM = tile_config::kGemm2TileM;
+constexpr int kGemm2TileN = tile_config::kGemm2TileN;
+constexpr int kGemm2TileK = tile_config::kGemm2TileK;
 
 #define CHECK_CUDA(expr)                                                                       \
   do {                                                                                         \
