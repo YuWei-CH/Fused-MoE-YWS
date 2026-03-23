@@ -3,6 +3,7 @@
 Usage:
     python scripts/sweep.py phase1
     python scripts/sweep.py phase2
+    python scripts/sweep.py threshold
 
 The candidate lists are intentionally hard-coded in this file.
 This script only sweeps the large workloads and prints latency / speedup / timeout.
@@ -36,6 +37,14 @@ class TileSet:
         return f"{self.m}x{self.n}x{self.k}"
 
 
+@dataclass
+class ConfigState:
+    gemm1: TileSet
+    gemm2: TileSet
+    gemm1_threshold: int
+    gemm2_threshold: int
+
+
 LARGE_WORKLOADS = [
     "5e8dc11c-f2a9-42d5-8dce-9419cbf34d5d",
     "58a34f27-7995-4155-8b46-f60a7225e20e",
@@ -59,6 +68,15 @@ PHASE2_GEMM2_CANDIDATES = [
     TileSet(8, 32, 32),
 ]
 
+THRESHOLD_CANDIDATES = [
+    992,
+    960,
+    928,
+    896,
+    832,
+    768,
+]
+
 
 @dataclass
 class WorkloadResult:
@@ -70,7 +88,7 @@ class WorkloadResult:
     json_path: Path
 
 
-def read_tile_config() -> dict[str, TileSet]:
+def read_tile_config() -> ConfigState:
     text = TILE_CONFIG_PATH.read_text()
 
     def extract(prefix: str) -> TileSet:
@@ -84,13 +102,26 @@ def read_tile_config() -> dict[str, TileSet]:
             raise RuntimeError(f"could not parse {prefix} tiles from {TILE_CONFIG_PATH}")
         return TileSet(*(int(group) for group in match.groups()))
 
-    return {
-        "gemm1": extract("Gemm1"),
-        "gemm2": extract("Gemm2"),
-    }
+    gemm1_threshold_match = re.search(
+        r"inline constexpr int kLargeGemm1TensorCoreThreshold = (\d+);", text
+    )
+    gemm2_threshold_match = re.search(
+        r"inline constexpr int kLargeGemm2TensorCoreThreshold = (\d+);", text
+    )
+    if not gemm1_threshold_match or not gemm2_threshold_match:
+        raise RuntimeError(f"could not parse tensor core thresholds from {TILE_CONFIG_PATH}")
+
+    return ConfigState(
+        gemm1=extract("Gemm1"),
+        gemm2=extract("Gemm2"),
+        gemm1_threshold=int(gemm1_threshold_match.group(1)),
+        gemm2_threshold=int(gemm2_threshold_match.group(1)),
+    )
 
 
-def write_tile_config(gemm1: TileSet, gemm2: TileSet) -> None:
+def write_tile_config(
+    gemm1: TileSet, gemm2: TileSet, gemm1_threshold: int, gemm2_threshold: int
+) -> None:
     text = TILE_CONFIG_PATH.read_text()
     replacements = {
         r"inline constexpr int kGemm1TileM = \d+;": f"inline constexpr int kGemm1TileM = {gemm1.m};",
@@ -99,6 +130,10 @@ def write_tile_config(gemm1: TileSet, gemm2: TileSet) -> None:
         r"inline constexpr int kGemm2TileM = \d+;": f"inline constexpr int kGemm2TileM = {gemm2.m};",
         r"inline constexpr int kGemm2TileN = \d+;": f"inline constexpr int kGemm2TileN = {gemm2.n};",
         r"inline constexpr int kGemm2TileK = \d+;": f"inline constexpr int kGemm2TileK = {gemm2.k};",
+        r"inline constexpr int kLargeGemm1TensorCoreThreshold = \d+;":
+            f"inline constexpr int kLargeGemm1TensorCoreThreshold = {gemm1_threshold};",
+        r"inline constexpr int kLargeGemm2TensorCoreThreshold = \d+;":
+            f"inline constexpr int kLargeGemm2TensorCoreThreshold = {gemm2_threshold};",
     }
     updated = text
     for pattern, replacement in replacements.items():
@@ -187,11 +222,21 @@ def run_one_workload(workload_uuid: str, output_dir: Path) -> WorkloadResult:
     return result
 
 
-def print_candidate_summary(index: int, gemm1: TileSet, gemm2: TileSet, results: list[WorkloadResult]) -> None:
-    pieces = [f"candidate {index}: GEMM1={gemm1} GEMM2={gemm2}"]
+def print_candidate_summary(
+    index: int,
+    gemm1: TileSet,
+    gemm2: TileSet,
+    gemm1_threshold: int,
+    gemm2_threshold: int,
+    results: list[WorkloadResult],
+) -> None:
+    pieces = [
+        f"candidate {index}: GEMM1={gemm1} GEMM2={gemm2} "
+        f"TH1={gemm1_threshold} TH2={gemm2_threshold}"
+    ]
     for result in results:
         slug = result.workload_uuid.split("-")[0]
-        if result.status == "SUCCESS" and result.latency_ms is not None and result.speedup_factor is not None:
+        if result.status == "PASSED" and result.latency_ms is not None and result.speedup_factor is not None:
             pieces.append(f"{slug} PASSED {result.latency_ms:.3f} ms {result.speedup_factor:.2f}x")
         else:
             pieces.append(f"{slug} {result.status}")
@@ -203,28 +248,52 @@ def sweep_phase(phase: str) -> None:
     output_dir = timestamped_dir(phase)
 
     if phase == "phase1":
-        candidates = [(gemm1, PHASE1_FIXED_GEMM2) for gemm1 in PHASE1_GEMM1_CANDIDATES]
+        candidates = [
+            (gemm1, PHASE1_FIXED_GEMM2, original.gemm1_threshold, original.gemm2_threshold)
+            for gemm1 in PHASE1_GEMM1_CANDIDATES
+        ]
+    elif phase == "phase2":
+        candidates = [
+            (PHASE2_FIXED_GEMM1, gemm2, original.gemm1_threshold, original.gemm2_threshold)
+            for gemm2 in PHASE2_GEMM2_CANDIDATES
+        ]
     else:
-        candidates = [(PHASE2_FIXED_GEMM1, gemm2) for gemm2 in PHASE2_GEMM2_CANDIDATES]
+        candidates = [
+            (original.gemm1, original.gemm2, threshold, original.gemm2_threshold)
+            for threshold in THRESHOLD_CANDIDATES
+        ]
 
     try:
         print_header(f"Sweep {phase}")
         print(f"Artifacts: {output_dir}")
-        for index, (gemm1, gemm2) in enumerate(candidates, start=1):
-            candidate_dir = output_dir / f"candidate_{index}_{gemm1}_{gemm2}"
-            print_header(f"Candidate {index}: GEMM1={gemm1} GEMM2={gemm2}")
-            write_tile_config(gemm1, gemm2)
+        for index, (gemm1, gemm2, gemm1_threshold, gemm2_threshold) in enumerate(candidates, start=1):
+            candidate_dir = output_dir / (
+                f"candidate_{index}_{gemm1}_{gemm2}_th1_{gemm1_threshold}_th2_{gemm2_threshold}"
+            )
+            print_header(
+                f"Candidate {index}: GEMM1={gemm1} GEMM2={gemm2} "
+                f"TH1={gemm1_threshold} TH2={gemm2_threshold}"
+            )
+            write_tile_config(gemm1, gemm2, gemm1_threshold, gemm2_threshold)
             pack_solution(candidate_dir)
             results = [run_one_workload(workload_uuid, candidate_dir) for workload_uuid in LARGE_WORKLOADS]
-            print_candidate_summary(index, gemm1, gemm2, results)
+            print_candidate_summary(index, gemm1, gemm2, gemm1_threshold, gemm2_threshold, results)
     finally:
-        write_tile_config(original["gemm1"], original["gemm2"])
-        print(f"\nRestored tile config to GEMM1={original['gemm1']} GEMM2={original['gemm2']}")
+        write_tile_config(original.gemm1, original.gemm2,
+                          original.gemm1_threshold, original.gemm2_threshold)
+        print(
+            f"\nRestored tile config to GEMM1={original.gemm1} "
+            f"GEMM2={original.gemm2} TH1={original.gemm1_threshold} TH2={original.gemm2_threshold}"
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Simple Modal sweep for GEMM tile tuning.")
-    parser.add_argument("phase", choices=["phase1", "phase2"], help="Sweep GEMM1 or GEMM2 candidates.")
+    parser.add_argument(
+        "phase",
+        choices=["phase1", "phase2", "threshold"],
+        help="Sweep GEMM1, GEMM2, or the large GEMM1 Tensor Core threshold.",
+    )
     args = parser.parse_args()
     sweep_phase(args.phase)
 

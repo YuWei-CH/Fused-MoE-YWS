@@ -2,6 +2,9 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include "tile_config.h"
+#include "cutlass/cutlass.h"
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/numeric_types.h"
 #include <tvm/ffi/container/shape.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
@@ -40,6 +43,10 @@ constexpr int kGemm1TileK = tile_config::kGemm1TileK;
 constexpr int kGemm2TileM = tile_config::kGemm2TileM;
 constexpr int kGemm2TileN = tile_config::kGemm2TileN;
 constexpr int kGemm2TileK = tile_config::kGemm2TileK;
+// The bf16 Tensor Core path is materially faster but slightly less accurate than the
+// stable SIMT kernel. Keep the threshold configurable so we can sweep the largest buckets only.
+constexpr int kLargeGemm1TensorCoreThreshold = tile_config::kLargeGemm1TensorCoreThreshold;
+constexpr int kLargeGemm2TensorCoreThreshold = tile_config::kLargeGemm2TensorCoreThreshold;
 
 #define CHECK_CUDA(expr)                                                                       \
   do {                                                                                         \
@@ -49,6 +56,31 @@ constexpr int kGemm2TileK = tile_config::kGemm2TileK;
                                    << ": " << cudaGetErrorString(err__);                     \
     }                                                                                          \
   } while (0)
+
+inline void CheckCutlassStatus(cutlass::Status status, const char* context) {
+  if (status != cutlass::Status::kSuccess) {
+    TVM_FFI_THROW(RuntimeError) << "CUTLASS error in " << context << ": "
+                                << cutlassGetStatusString(status);
+  }
+}
+
+namespace cutlass_tensorop_bf16 {
+
+using ElementA = cutlass::bfloat16_t;
+using LayoutA = cutlass::layout::RowMajor;
+
+using ElementB = cutlass::bfloat16_t;
+using LayoutB = cutlass::layout::ColumnMajor;
+
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+
+using ElementAccumulator = float;
+using Gemm = cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
+                                         ElementAccumulator, cutlass::arch::OpClassTensorOp,
+                                         cutlass::arch::Sm80>;
+
+}  // namespace cutlass_tensorop_bf16
 
 void CheckTensor(const ffi::TensorView& tensor, const char* name, int32_t ndim,
                  ffi::ShapeView expected_shape, DLDataType expected_dtype) {
@@ -139,9 +171,14 @@ class AsyncBuffer {
 
  private:
   T* ptr_ = nullptr;
-  size_t count_ = 0;
+ size_t count_ = 0;
   cudaStream_t stream_ = nullptr;
 };
+
+template <typename T>
+constexpr T AlignUp(T value, T alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
 
 bool EnvFlagEnabled(const char* name) {
   const char* value = std::getenv(name);
@@ -556,6 +593,103 @@ __global__ void gather_rows_vec4_kernel(const float4* src, const int32_t* token_
   }
 }
 
+__global__ void cast_fp32_to_bf16_kernel(const float* src, cutlass::bfloat16_t* dst,
+                                         int64_t total) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) {
+    return;
+  }
+  dst[idx] = cutlass::bfloat16_t(src[idx]);
+}
+
+__global__ void dequant_fp8_to_bf16_colmajor_kernel(const __nv_fp8_e4m3* src,
+                                                    const float* scale,
+                                                    cutlass::bfloat16_t* dst, int64_t n,
+                                                    int64_t k) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = n * k;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / k;
+  int64_t col = idx % k;
+  int64_t scale_idx = static_cast<int64_t>(row / kBlock) * (k / kBlock) + (col / kBlock);
+  float value = fp8_to_float(src[idx]) * scale[scale_idx];
+  // Column-major [k, n] has the same physical layout as row-major [n, k].
+  dst[idx] = cutlass::bfloat16_t(value);
+}
+
+void RunLargeBucketGemmCutlassBf16(const float* a_fp32,
+                                   const std::vector<int32_t>& host_bucket_expert_ids,
+                                   const __nv_fp8_e4m3* weights, const float* weights_scale,
+                                   float* output, int64_t rows_per_expert, int64_t n, int64_t k,
+                                   const char* can_context, const char* run_context,
+                                   cudaStream_t stream) {
+  using namespace cutlass_tensorop_bf16;
+  const int m = static_cast<int>(rows_per_expert);
+
+  Gemm gemm_op;
+  AsyncBuffer<ElementA> a_bf16(
+      static_cast<size_t>(host_bucket_expert_ids.size()) * rows_per_expert * k, stream);
+  AsyncBuffer<ElementB> b_bf16(static_cast<size_t>(n) * k, stream);
+
+  int threads = 256;
+  int64_t a_total = static_cast<int64_t>(host_bucket_expert_ids.size()) * rows_per_expert * k;
+  cast_fp32_to_bf16_kernel<<<(a_total + threads - 1) / threads, threads, 0, stream>>>(
+      a_fp32, a_bf16.get(), a_total);
+  CHECK_CUDA(cudaGetLastError());
+
+  for (int64_t expert_idx = 0; expert_idx < static_cast<int64_t>(host_bucket_expert_ids.size());
+       ++expert_idx) {
+    int32_t local_expert = host_bucket_expert_ids[static_cast<size_t>(expert_idx)];
+    const ElementA* a_ptr = a_bf16.get() + expert_idx * rows_per_expert * k;
+    const __nv_fp8_e4m3* b_src = weights + static_cast<int64_t>(local_expert) * n * k;
+    const float* b_scale =
+        weights_scale + static_cast<int64_t>(local_expert) * (n / kBlock) * (k / kBlock);
+    ElementB* b_ptr = b_bf16.get();
+    float* d_ptr = output + expert_idx * rows_per_expert * n;
+
+    int64_t dequant_total = static_cast<int64_t>(n) * k;
+    dequant_fp8_to_bf16_colmajor_kernel<<<(dequant_total + threads - 1) / threads, threads, 0,
+                                          stream>>>(b_src, b_scale, b_bf16.get(), n, k);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaMemsetAsync(d_ptr, 0, sizeof(float) * static_cast<size_t>(rows_per_expert) * n,
+                               stream));
+
+    typename Gemm::Arguments args{
+        {m, static_cast<int>(n), static_cast<int>(k)},
+        {a_ptr, static_cast<int>(k)},
+        {b_ptr, static_cast<int>(k)},
+        {d_ptr, static_cast<int>(n)},
+        {d_ptr, static_cast<int>(n)},
+        {1.0f, 0.0f},
+    };
+
+    CheckCutlassStatus(Gemm::can_implement(args), can_context);
+    CheckCutlassStatus(gemm_op(args, nullptr, stream), run_context);
+  }
+}
+
+void RunLargeBucketGemm1CutlassBf16(
+    const float* a_fp32, const std::vector<int32_t>& host_bucket_expert_ids,
+    const __nv_fp8_e4m3* gemm1_weights, const float* gemm1_weights_scale, float* g1,
+    int64_t rows_per_expert, cudaStream_t stream) {
+  RunLargeBucketGemmCutlassBf16(a_fp32, host_bucket_expert_ids, gemm1_weights,
+                                gemm1_weights_scale, g1, rows_per_expert,
+                                2 * kIntermediateSize, kHiddenSize,
+                                "GEMM1 CUTLASS can_implement", "GEMM1 CUTLASS run", stream);
+}
+
+void RunLargeBucketGemm2CutlassBf16(
+    const float* c_fp32, const std::vector<int32_t>& host_bucket_expert_ids,
+    const __nv_fp8_e4m3* gemm2_weights, const float* gemm2_weights_scale, float* o,
+    int64_t rows_per_expert, cudaStream_t stream) {
+  RunLargeBucketGemmCutlassBf16(c_fp32, host_bucket_expert_ids, gemm2_weights,
+                                gemm2_weights_scale, o, rows_per_expert, kHiddenSize,
+                                kIntermediateSize, "GEMM2 CUTLASS can_implement",
+                                "GEMM2 CUTLASS run", stream);
+}
+
 // GEMM1 specialized for A: [Tk, H], W13: [2I, H] stored as FP8 block-scaled weights.
 // We tile along M/N/K, stage A and on-the-fly dequantized W13 into shared memory, and
 // accumulate in FP32 without materializing the full dequantized W13 tensor.
@@ -959,8 +1093,10 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
                                  sizeof(int32_t) * bucket_rows, cudaMemcpyHostToDevice, stream));
     });
 
-    int64_t gather_total = bucket_rows * kHiddenVecWidth;
+    bool use_gemm1_cutlass_path = bucket_tk >= kLargeGemm1TensorCoreThreshold;
+    bool use_gemm2_cutlass_path = bucket_tk >= kLargeGemm2TensorCoreThreshold;
     time_cuda(&timings.gather_ms, [&] {
+      int64_t gather_total = bucket_rows * kHiddenVecWidth;
       gather_rows_vec4_kernel<<<(gather_total + threads_1d - 1) / threads_1d, threads_1d, 0,
                                 stream>>>(
           reinterpret_cast<const float4*>(a_fp32.get()), bucket_token_idx_device.get(),
@@ -969,14 +1105,26 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
     });
 
     time_cuda(&timings.gemm1_ms, [&] {
-      dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
-      dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
-                      (bucket_tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
-      gemm1_tiled_fused_w13_grouped_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
-          a_e.get(), bucket_expert_ids_device.get(),
-          static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
-          static_cast<const float*>(gemm1_weights_scale.data_ptr()), g1.get(), bucket_tk);
-      CHECK_CUDA(cudaGetLastError());
+      if (use_gemm1_cutlass_path) {
+        CHECK_CUDA(cudaMemsetAsync(g1.get(), 0,
+                                   sizeof(float) * static_cast<size_t>(bucket_rows) *
+                                       (2 * kIntermediateSize),
+                                   stream));
+        RunLargeBucketGemm1CutlassBf16(
+            a_e.get(), host_bucket_expert_ids,
+            static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
+            static_cast<const float*>(gemm1_weights_scale.data_ptr()), g1.get(), bucket_tk,
+            stream);
+      } else {
+        dim3 gemm1_block(kGemm1TileN, kGemm1TileM);
+        dim3 gemm1_grid((2 * kIntermediateSize + kGemm1TileN - 1) / kGemm1TileN,
+                        (bucket_tk + kGemm1TileM - 1) / kGemm1TileM, bucket_experts);
+        gemm1_tiled_fused_w13_grouped_kernel<<<gemm1_grid, gemm1_block, 0, stream>>>(
+            a_e.get(), bucket_expert_ids_device.get(),
+            static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()),
+            static_cast<const float*>(gemm1_weights_scale.data_ptr()), g1.get(), bucket_tk);
+        CHECK_CUDA(cudaGetLastError());
+      }
     });
 
     int64_t swiglu_total = bucket_rows * kIntermediateSize;
@@ -987,14 +1135,24 @@ ffi::Tensor kernel(const ffi::TensorView& routing_logits, const ffi::TensorView&
     });
 
     time_cuda(&timings.gemm2_ms, [&] {
-      dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
-      dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
-                      (bucket_tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
-      gemm2_tiled_fused_w2_grouped_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
-          c.get(), bucket_expert_ids_device.get(),
-          static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
-          static_cast<const float*>(gemm2_weights_scale.data_ptr()), o.get(), bucket_tk);
-      CHECK_CUDA(cudaGetLastError());
+      if (use_gemm2_cutlass_path) {
+        CHECK_CUDA(cudaMemsetAsync(
+            o.get(), 0, sizeof(float) * static_cast<size_t>(bucket_rows) * kHiddenSize, stream));
+        RunLargeBucketGemm2CutlassBf16(
+            c.get(), host_bucket_expert_ids,
+            static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
+            static_cast<const float*>(gemm2_weights_scale.data_ptr()), o.get(), bucket_tk,
+            stream);
+      } else {
+        dim3 gemm2_block(kGemm2TileN, kGemm2TileM);
+        dim3 gemm2_grid((kHiddenSize + kGemm2TileN - 1) / kGemm2TileN,
+                        (bucket_tk + kGemm2TileM - 1) / kGemm2TileM, bucket_experts);
+        gemm2_tiled_fused_w2_grouped_kernel<<<gemm2_grid, gemm2_block, 0, stream>>>(
+            c.get(), bucket_expert_ids_device.get(),
+            static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()),
+            static_cast<const float*>(gemm2_weights_scale.data_ptr()), o.get(), bucket_tk);
+        CHECK_CUDA(cudaGetLastError());
+      }
     });
 
     int64_t scatter_total = bucket_tk * kHiddenVecWidth;
