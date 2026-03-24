@@ -1,12 +1,10 @@
 """
 Pack solution source files into solution.json.
 
-Reads configuration from config.toml and recursively packs the source tree
-under the selected solution directory. This preserves nested headers such as
-vendored CUTLASS includes.
+Reads configuration from config.toml and packs the appropriate source files
+(Triton or CUDA) into a Solution JSON file for submission.
 """
 
-import json
 import sys
 from pathlib import Path
 
@@ -18,6 +16,9 @@ try:
     import tomllib
 except ImportError:
     import tomli as tomllib
+
+from flashinfer_bench import BuildSpec
+from flashinfer_bench.agents import pack_solution_from_files
 
 
 def load_config() -> dict:
@@ -51,54 +52,41 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    spec = {
+    spec_kwargs = {
         "language": language,
         "target_hardware": ["cuda"],
         "entry_point": entry_point,
     }
 
     if "destination_passing_style" in build_config:
-        spec["destination_passing_style"] = build_config["destination_passing_style"]
+        spec_kwargs["destination_passing_style"] = build_config[
+            "destination_passing_style"
+        ]
 
     if "binding" in build_config:
-        spec["binding"] = build_config["binding"]
+        spec_kwargs["binding"] = build_config["binding"]
 
-    if "dependencies" in build_config:
-        spec["dependencies"] = build_config["dependencies"]
-    else:
-        spec["dependencies"] = []
+    # Create build spec
+    spec = BuildSpec(**spec_kwargs)
 
-    sources = []
-    for path in sorted(source_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        if "__pycache__" in path.parts or path.suffix == ".pyc":
-            continue
-        sources.append(
-            {
-                "path": str(path.relative_to(source_dir)).replace("\\", "/"),
-                "content": path.read_text(),
-            }
-        )
-
-    solution = {
-        "name": solution_config["name"],
-        "definition": solution_config["definition"],
-        "author": solution_config["author"],
-        "spec": spec,
-        "sources": sources,
-        "description": solution_config.get("description", ""),
-    }
+    # Pack the solution
+    solution = pack_solution_from_files(
+        path=str(source_dir),
+        spec=spec,
+        name=solution_config["name"],
+        definition=solution_config["definition"],
+        author=solution_config["author"],
+    )
 
     # Write to output file
     if output_path is None:
         output_path = PROJECT_ROOT / "solution.json"
 
-    output_path.write_text(json.dumps(solution, indent=2))
+    output_path.write_text(solution.model_dump_json(indent=2))
     print(f"Solution packed: {output_path}")
-    print(f"  Name: {solution['name']}")
-    print(f"  Definition: {solution['definition']}")
-    print(f"  Author: {solution['author']}")
+    print(f"  Name: {solution.name}")
+    print(f"  Definition: {solution.definition}")
+    print(f"  Author: {solution.author}")
     print(f"  Language: {language}")
 
     return output_path
@@ -108,12 +96,15 @@ def main():
     """Entry point for pack_solution script."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Pack solution files into solution.json")
+    parser = argparse.ArgumentParser(
+        description="Pack solution files into solution.json"
+    )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
-        help="Output path for solution.json (default: ./solution.json)"
+        help="Output path for solution.json (default: ./solution.json)",
     )
     args = parser.parse_args()
 

@@ -13,21 +13,12 @@ from tvm.ffi import register_func
 
 THIS_DIR = Path(__file__).resolve().parent
 KERNEL_PATH = THIS_DIR / "kernel.cu"
-SOURCE_PATHS = tuple(
-    path
-    for path in sorted(THIS_DIR.rglob("*"))
-    if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
-)
 
 # hash-based JIT extension loading (For test now)
 @lru_cache(maxsize=1)
 def _load_extension():
     ### Read .cu file, compute hash, and create module
-    hasher = hashlib.sha1()
-    for path in SOURCE_PATHS:
-        hasher.update(str(path.relative_to(THIS_DIR)).encode())
-        hasher.update(path.read_bytes())
-    source_hash = hasher.hexdigest()[:12]
+    source_hash = hashlib.sha1(KERNEL_PATH.read_bytes()).hexdigest()[:12]
     module_name = f"flashinfer_moe_cuda_{source_hash}"
     return load(
         name=module_name,
