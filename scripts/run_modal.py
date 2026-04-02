@@ -27,13 +27,25 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+CUTLASS_INCLUDE_FALLBACKS = [
+    "/opt/conda/envs/py312/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
+    "/opt/conda/envs/py312/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include",
+]
+CUTLASS_INCLUDE_PATH = ":".join(CUTLASS_INCLUDE_FALLBACKS)
+
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
-        add_python="3.12",
+        "flashinfer/flashinfer-ci-cu132:latest",
     )
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
-    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .pip_install("flashinfer-bench")
+    .env(
+        {
+            "CUDA_HOME": "/usr/local/cuda",
+            # Expose preinstalled CUTLASS headers to the CUDA C++ builder.
+            "CPLUS_INCLUDE_PATH": CUTLASS_INCLUDE_PATH,
+            "C_INCLUDE_PATH": CUTLASS_INCLUDE_PATH,
+        }
+    )
 )
 
 
@@ -126,6 +138,7 @@ def run_benchmark(
                 print(trace.evaluation.log)
 
     return results
+
 
 
 def print_results(results: dict):

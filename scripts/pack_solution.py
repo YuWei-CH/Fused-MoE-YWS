@@ -2,8 +2,7 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and recursively packs the source tree
-under the selected solution directory. This preserves nested headers such as
-vendored CUTLASS includes.
+under the selected solution directory.
 """
 
 import json
