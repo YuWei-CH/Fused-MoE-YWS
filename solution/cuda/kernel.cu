@@ -4,7 +4,12 @@
 #include "tile_config.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/gemm_universal.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/numeric_types.h"
+#include "cute/tensor.hpp"
 #include <tvm/ffi/container/shape.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
@@ -81,6 +86,59 @@ using Gemm = cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, E
                                          cutlass::arch::Sm80>;
 
 }  // namespace cutlass_tensorop_bf16
+
+namespace cutlass_sm100_fp8 {
+
+using namespace cute;
+
+using ElementA = cutlass::float_e4m3_t;
+using LayoutA = cutlass::layout::RowMajor;
+using ElementB = cutlass::float_e4m3_t;
+using LayoutB = cutlass::layout::ColumnMajor;
+using ElementC = float;
+using LayoutC = cutlass::layout::RowMajor;
+using ElementD = cutlass::bfloat16_t;
+using LayoutD = cutlass::layout::RowMajor;
+
+using ElementAccumulator = float;
+using ElementSF = float;
+
+// SM100 Blackwell configuration
+using ArchTag = cutlass::arch::Sm100;
+using OpClass = cutlass::arch::OpClassTensorOp;
+
+// Tile shape and Cluster shape
+using TileShape = Shape<_128, _128, _128>;
+using ClusterShape = Shape<_1, _1, _1>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OpClass,
+    TileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileM1,
+    ElementAccumulator, ElementAccumulator,
+    ElementD, LayoutD, 8,
+    ElementC, LayoutC, 8,
+    cutlass::epilogue::collective::EpilogueScheduleWarpSpecialized
+>::CollectiveOp;
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OpClass,
+    ElementA, LayoutA, 16,
+    ElementB, LayoutB, 16,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename CollectiveEpilogue::SharedStorage)>,
+    cutlass::gemm::KernelTmaWarpSpecializedMmaTransformSm100
+>::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloop,
+    CollectiveEpilogue
+>;
+
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+}  // namespace cutlass_sm100_fp8
 
 void CheckTensor(const ffi::TensorView& tensor, const char* name, int32_t ndim,
                  ffi::ShapeView expected_shape, DLDataType expected_dtype) {
@@ -688,6 +746,65 @@ void RunLargeBucketGemm2CutlassBf16(
                                 gemm2_weights_scale, o, rows_per_expert, kHiddenSize,
                                 kIntermediateSize, "GEMM2 CUTLASS can_implement",
                                 "GEMM2 CUTLASS run", stream);
+}
+
+void RunLargeBucketGemmSm100Fp8(
+    const __nv_fp8_e4m3* a_fp8, const float* a_scale,
+    const std::vector<int32_t>& host_bucket_expert_ids,
+    const __nv_fp8_e4m3* weights, const float* weights_scale,
+    float* output, int64_t rows_per_expert, int64_t n, int64_t k,
+    cudaStream_t stream) {
+  
+  using namespace cutlass_sm100_fp8;
+
+  int m = static_cast<int>(rows_per_expert);
+
+  for (size_t expert_idx = 0; expert_idx < host_bucket_expert_ids.size(); ++expert_idx) {
+    int32_t local_expert = host_bucket_expert_ids[expert_idx];
+    
+    // Problem shape: <M, N, K, L=1>
+    Gemm::ProblemShape problem_shape{m, static_cast<int>(n), static_cast<int>(k), 1};
+
+    // Pointers for this expert
+    const ElementA* ptr_A = reinterpret_cast<const ElementA*>(a_fp8 + expert_idx * m * k);
+    const ElementB* ptr_B = reinterpret_cast<const ElementB*>(weights + static_cast<int64_t>(local_expert) * n * k);
+    float* ptr_D = output + expert_idx * m * n;
+    
+    // Scale pointers
+    const ElementSF* ptr_SFA = a_scale + expert_idx * (m / kBlock) * (k / kBlock);
+    const ElementSF* ptr_SFB = weights_scale + static_cast<int64_t>(local_expert) * (n / kBlock) * (k / kBlock);
+
+    Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      problem_shape,
+      { // Mainloop
+        ptr_A,
+        {static_cast<int>(k), _1{}, _0{}}, // StrideA: <K, 1, 0>
+        ptr_B,
+        {static_cast<int>(k), _1{}, _0{}}, // StrideB: <K, 1, 0>
+        ptr_SFA,
+        {}, // LayoutSFA (Auto-inferred usually)
+        ptr_SFB,
+        {}, // LayoutSFB
+      },
+      { // Epilogue
+        {}, // Thread params
+        ptr_D,
+        {static_cast<int>(n), _1{}, _0{}}, // StrideD: <N, 1, 0>
+        ptr_D,
+        {static_cast<int>(n), _1{}, _0{}}, // StrideC
+      }
+    };
+
+    Gemm gemm_op;
+    
+    size_t workspace_size = Gemm::get_workspace_size(args);
+    AsyncBuffer<uint8_t> workspace(workspace_size, stream);
+    
+    CheckCutlassStatus(gemm_op.can_implement(args), "SM100 FP8 can_implement");
+    CheckCutlassStatus(gemm_op.initialize(args, workspace.get(), stream), "SM100 FP8 initialize");
+    CheckCutlassStatus(gemm_op.run(stream), "SM100 FP8 run");
+  }
 }
 
 // GEMM1 specialized for A: [Tk, H], W13: [2I, H] stored as FP8 block-scaled weights.
