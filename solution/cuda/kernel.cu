@@ -1,9 +1,14 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
 #include "tile_config.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/numeric_types.h"
 #include "cute/tensor.hpp"
 #include <tvm/ffi/container/shape.h>
@@ -33,6 +38,27 @@ constexpr int64_t kTopK = 8;
 constexpr int64_t kNumGroups = 8;
 constexpr int64_t kTopKGroups = 4;
 constexpr int64_t kGroupSize = kGlobalExperts / kNumGroups;
+
+namespace cutlass_grouped {
+  using ElementA = cutlass::bfloat16_t;
+  using ElementB = cutlass::bfloat16_t;
+  using ElementC = float;
+  using ElementAccumulator = float;
+
+  using GemmGrouped = cutlass::gemm::device::GemmGrouped<
+      typename cutlass::gemm::kernel::DefaultGemmGrouped<
+          ElementA, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 8,
+          ElementB, cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 8,
+          ElementC, cutlass::layout::RowMajor,
+          ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+          cutlass::gemm::GemmShape<128, 128, 32>,
+          cutlass::gemm::GemmShape<64, 64, 32>,
+          cutlass::gemm::GemmShape<16, 8, 8>,
+          cutlass::epilogue::thread::LinearCombination<ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, ElementAccumulator, ElementAccumulator>,
+          cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>,
+          4
+      >::GemmKernel>;
+}
 
 #define CHECK_CUDA(call)                                                                           \
   do {                                                                                             \
@@ -150,42 +176,52 @@ __global__ void reorder_tokens_kernel(const int32_t* topk_idx, const int32_t* ex
   }
 }
 
-__global__ void dequant_weights_to_f32_kernel(const uint8_t* src, const float* scale, float* dst, int64_t num_experts, int64_t n, int64_t k) {
+__global__ void dequant_weights_to_bf16_kernel(const uint8_t* src, const float* scale, cutlass::bfloat16_t* dst, int64_t num_experts, int64_t n, int64_t k) {
   int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   int64_t expert_size = n * k;
   if (idx >= num_experts * expert_size) return;
   int64_t ex = idx / expert_size; int64_t off = idx % expert_size;
   int64_t row = off / k; int64_t col = off % k;
   int64_t n_blks = n / kBlock; int64_t k_blks = k / kBlock;
-  dst[idx] = fp8_e4m3_to_float(src[idx]) * scale[ex * n_blks * k_blks + (row / kBlock) * k_blks + (col / kBlock)];
+  float val = fp8_e4m3_to_float(src[idx]) * scale[ex * n_blks * k_blks + (row / kBlock) * k_blks + (col / kBlock)];
+  dst[idx] = cutlass::bfloat16_t(val);
 }
 
-__global__ void fused_gather_dequant_f32_kernel(const uint8_t* src, const int32_t* token_idx, const float* scale_src, float* dst, int64_t m, int64_t scale_t) {
+__global__ void fused_gather_dequant_bf16_kernel(const uint8_t* src, const int32_t* token_idx, const float* scale_src, cutlass::bfloat16_t* dst, int64_t m, int64_t scale_t) {
   int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= m * kHiddenSize) return;
   int64_t row = idx / kHiddenSize; int64_t col = idx % kHiddenSize;
   int32_t token = token_idx[row];
-  if (token < 0) { dst[idx] = 0.0f; return; }
+  if (token < 0) { dst[idx] = cutlass::bfloat16_t(0.0f); return; }
   float scale = scale_src[(int64_t)(col / kBlock) * scale_t + token];
-  dst[idx] = fp8_e4m3_to_float(src[(int64_t)token * kHiddenSize + col]) * scale;
+  float val = fp8_e4m3_to_float(src[(int64_t)token * kHiddenSize + col]) * scale;
+  dst[idx] = cutlass::bfloat16_t(val);
 }
 
-__global__ void swiglu_f32_kernel(const float* g1, float* c, int64_t total_rows) {
+__global__ void swiglu_bf16_kernel(const float* g1, cutlass::bfloat16_t* c, int64_t total_rows) {
   int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total_rows * kIntermediateSize) return;
   int64_t row = idx / kIntermediateSize; int64_t col = idx % kIntermediateSize;
   float x1 = g1[row * 2 * kIntermediateSize + col];
   float x2 = g1[row * 2 * kIntermediateSize + kIntermediateSize + col];
-  c[idx] = x1 * (x2 / (1.0f + expf(-x2)));
+  float val = x1 * (x2 / (1.0f + expf(-x2)));
+  c[idx] = cutlass::bfloat16_t(val);
 }
 
-__global__ void optimized_scatter_add_kernel(const float* o, const int32_t* token_idx, const float* weights, float* output, int64_t rows, int32_t global_expert) {
+__global__ void optimized_scatter_add_kernel(const float* o, const int32_t* token_idx, const float* weights, float* output, int64_t total_reordered, int32_t local_expert_offset, const int32_t* expert_offsets) {
   int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= rows * kHiddenSize) return;
+  if (idx >= total_reordered * kHiddenSize) return;
   int64_t row = idx / kHiddenSize;
   int32_t token = token_idx[row];
   if (token < 0) return;
-  float w = weights[(int64_t)token * kGlobalExperts + global_expert];
+  
+  int32_t le = -1;
+  for (int i = 0; i < kLocalExperts; ++i) {
+    if (row >= expert_offsets[i] && row < expert_offsets[i+1]) { le = i; break; }
+  }
+  if (le == -1) return;
+
+  float w = weights[(int64_t)token * kGlobalExperts + (le + local_expert_offset)];
   atomicAdd(&output[(int64_t)token * kHiddenSize + (idx % kHiddenSize)], o[idx] * w);
 }
 
@@ -194,15 +230,35 @@ __global__ void cast_output_kernel(const float* src, __nv_bfloat16* dst, int64_t
   if (idx < total) dst[idx] = __float2bfloat16(src[idx]);
 }
 
-void RunGemmF32(const float* a, const float* b, float* d, int m, int n, int k, cudaStream_t stream) {
-  using ElementA = float; using LayoutA = cutlass::layout::RowMajor;
-  using ElementB = float; using LayoutB = cutlass::layout::ColumnMajor;
-  using ElementC = float; using LayoutC = cutlass::layout::RowMajor;
-  using Gemm = cutlass::gemm::device::Gemm<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC, float, cutlass::arch::OpClassSimt, cutlass::arch::Sm80>;
-  Gemm gemm_op;
-  typename Gemm::Arguments args({m, n, k}, {(ElementA*)a, k}, {(ElementB*)b, k}, {(ElementC*)d, n}, {(ElementC*)d, n}, {1.0f, 0.0f});
-  CheckCutlassStatus(gemm_op.initialize(args, nullptr, stream), "GEMM F32");
-  CheckCutlassStatus(gemm_op.run(stream), "GEMM F32 run");
+void RunGroupedGemm(cutlass::gemm::GemmCoord* d_problem_sizes, 
+                    cutlass::gemm::GemmCoord* h_problem_sizes,
+                    cutlass_grouped::ElementA** ptr_A, 
+                    cutlass_grouped::ElementB** ptr_B, 
+                    cutlass_grouped::ElementC** ptr_C, 
+                    cutlass_grouped::ElementC** ptr_D,
+                    int expert_count, int k, int n, cudaStream_t stream) {
+  using GemmGrouped = cutlass_grouped::GemmGrouped;
+  
+  std::vector<int64_t> lda(expert_count, k), ldb(expert_count, k), ldc(expert_count, n), ldd(expert_count, n);
+  AsyncBuffer<int64_t> d_lda(expert_count, stream), d_ldb(expert_count, stream), d_ldc(expert_count, stream), d_ldd(expert_count, stream);
+  CHECK_CUDA(cudaMemcpyAsync(d_lda.get(), lda.data(), expert_count * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ldb.get(), ldb.data(), expert_count * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ldc.get(), ldc.data(), expert_count * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ldd.get(), ldd.data(), expert_count * sizeof(int64_t), cudaMemcpyHostToDevice, stream));
+
+  typename GemmGrouped::Arguments args(
+      d_problem_sizes, expert_count, 1, 
+      { (float)1.0f, (float)0.0f },
+      ptr_A, ptr_B, ptr_C, ptr_D,
+      d_lda.get(), d_ldb.get(), d_ldc.get(), d_ldd.get(),
+      h_problem_sizes
+  );
+
+  GemmGrouped gemm_op;
+  size_t workspace_size = gemm_op.get_workspace_size(args);
+  AsyncBuffer<uint8_t> workspace(workspace_size, stream);
+  CheckCutlassStatus(gemm_op.initialize(args, workspace.get(), stream), "Grouped GEMM Init");
+  CheckCutlassStatus(gemm_op.run(stream), "Grouped GEMM Run");
 }
 
 } // namespace
@@ -225,44 +281,81 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   sigmoid_bias_kernel<<<(t*kGlobalExperts+255)/256, 256, 0, stream>>>((float*)routing_logits.data_ptr(), (__nv_bfloat16*)routing_bias.data_ptr(), s.get(), s_wb.get(), t);
   routing_select_kernel<<<t, 1, 0, stream>>>(s.get(), s_wb.get(), tk_idx.get(), w.get(), t, routed_scaling_factor);
   
-  // GPU Bucketing
   AsyncBuffer<int32_t> d_expert_counts(kLocalExperts, stream), d_expert_offsets(kLocalExperts + 1, stream), d_reordered_tokens(t * kTopK, stream), d_tmp_counts(kLocalExperts, stream);
   CHECK_CUDA(cudaMemsetAsync(d_expert_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
   CHECK_CUDA(cudaMemsetAsync(d_tmp_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
   
   count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(tk_idx.get(), d_expert_counts.get(), t, (int32_t)local_expert_offset);
   
-  std::vector<int32_t> h_expert_counts(kLocalExperts);
-  CHECK_CUDA(cudaMemcpyAsync(h_expert_counts.data(), d_expert_counts.get(), kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-  CHECK_CUDA(cudaStreamSynchronize(stream));
-  
-  std::vector<int32_t> h_expert_offsets(kLocalExperts + 1, 0);
-  for (int i = 0; i < kLocalExperts; ++i) h_expert_offsets[i+1] = h_expert_offsets[i] + h_expert_counts[i];
-  CHECK_CUDA(cudaMemcpyAsync(d_expert_offsets.get(), h_expert_offsets.data(), (kLocalExperts + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+  thrust::device_ptr<int32_t> dev_counts_ptr(d_expert_counts.get());
+  thrust::device_ptr<int32_t> dev_offsets_ptr(d_expert_offsets.get());
+  thrust::exclusive_scan(thrust::cuda::par.on(stream), dev_counts_ptr, dev_counts_ptr + kLocalExperts + 1, dev_offsets_ptr);
   
   reorder_tokens_kernel<<<t, 1, 0, stream>>>(tk_idx.get(), d_expert_offsets.get(), d_tmp_counts.get(), d_reordered_tokens.get(), t, (int32_t)local_expert_offset);
 
-  AsyncBuffer<float> w13_f32(kLocalExperts * 2 * kIntermediateSize * kHiddenSize, stream);
-  AsyncBuffer<float> w2_f32(kLocalExperts * kHiddenSize * kIntermediateSize, stream);
-  dequant_weights_to_f32_kernel<<<(w13_f32.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm1_weights.data_ptr(), (float*)gemm1_weights_scale.data_ptr(), w13_f32.get(), kLocalExperts, 2*kIntermediateSize, kHiddenSize);
-  dequant_weights_to_f32_kernel<<<(w2_f32.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm2_weights.data_ptr(), (float*)gemm2_weights_scale.data_ptr(), w2_f32.get(), kLocalExperts, kHiddenSize, kIntermediateSize);
+  AsyncBuffer<cutlass::bfloat16_t> w13_bf16(kLocalExperts * 2 * kIntermediateSize * kHiddenSize, stream);
+  AsyncBuffer<cutlass::bfloat16_t> w2_bf16(kLocalExperts * kHiddenSize * kIntermediateSize, stream);
+  dequant_weights_to_bf16_kernel<<<(w13_bf16.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm1_weights.data_ptr(), (float*)gemm1_weights_scale.data_ptr(), w13_bf16.get(), kLocalExperts, 2*kIntermediateSize, kHiddenSize);
+  dequant_weights_to_bf16_kernel<<<(w2_bf16.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm2_weights.data_ptr(), (float*)gemm2_weights_scale.data_ptr(), w2_bf16.get(), kLocalExperts, kHiddenSize, kIntermediateSize);
 
-  int64_t total_reordered = h_expert_offsets[kLocalExperts];
-  if (total_reordered == 0) { cast_output_kernel<<<(t*kHiddenSize+255)/256, 256, 0, stream>>>(o_f32.get(), (__nv_bfloat16*)output_tensor.data_ptr(), t*kHiddenSize); CHECK_CUDA(cudaStreamSynchronize(stream)); return output_tensor; }
+  int32_t h_total_reordered;
+  CHECK_CUDA(cudaMemcpyAsync(&h_total_reordered, d_expert_offsets.get() + kLocalExperts, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+  if (h_total_reordered == 0) { cast_output_kernel<<<(t*kHiddenSize+255)/256, 256, 0, stream>>>(o_f32.get(), (__nv_bfloat16*)output_tensor.data_ptr(), t*kHiddenSize); CHECK_CUDA(cudaStreamSynchronize(stream)); return output_tensor; }
 
-  AsyncBuffer<float> a_f32(total_reordered * kHiddenSize, stream);
-  AsyncBuffer<float> g1(total_reordered * 2 * kIntermediateSize, stream), c(total_reordered * kIntermediateSize, stream), o(total_reordered * kHiddenSize, stream);
+  AsyncBuffer<cutlass::bfloat16_t> a_bf16(h_total_reordered * kHiddenSize, stream);
+  AsyncBuffer<float> g1(h_total_reordered * 2 * kIntermediateSize, stream);
+  AsyncBuffer<cutlass::bfloat16_t> c_bf16(h_total_reordered * kIntermediateSize, stream);
+  AsyncBuffer<float> o_grouped(h_total_reordered * kHiddenSize, stream);
 
-  for (int32_t le = 0; le < kLocalExperts; ++le) {
-    int32_t m = h_expert_counts[le];
-    if (m <= 0) continue;
-    int32_t offset = h_expert_offsets[le];
-    fused_gather_dequant_f32_kernel<<<(m*kHiddenSize+255)/256, 256, 0, stream>>>((uint8_t*)hidden_states.data_ptr(), d_reordered_tokens.get() + offset, (float*)hidden_states_scale.data_ptr(), a_f32.get() + (int64_t)offset * kHiddenSize, m, scale_t);
-    RunGemmF32(a_f32.get() + (int64_t)offset * kHiddenSize, w13_f32.get() + (int64_t)le * 2 * kIntermediateSize * kHiddenSize, g1.get() + (int64_t)offset * 2 * kIntermediateSize, m, 2*kIntermediateSize, kHiddenSize, stream);
-    swiglu_f32_kernel<<<((m*kIntermediateSize)+255)/256, 256, 0, stream>>>(g1.get() + (int64_t)offset * 2 * kIntermediateSize, c.get() + (int64_t)offset * kIntermediateSize, m);
-    RunGemmF32(c.get() + (int64_t)offset * kIntermediateSize, w2_f32.get() + (int64_t)le * kHiddenSize * kIntermediateSize, o.get() + (int64_t)offset * kHiddenSize, m, kHiddenSize, kIntermediateSize, stream);
-    optimized_scatter_add_kernel<<<((m*kHiddenSize)+255)/256, 256, 0, stream>>>(o.get() + (int64_t)offset * kHiddenSize, d_reordered_tokens.get() + offset, w.get(), o_f32.get(), m, (int32_t)(le + local_expert_offset));
+  fused_gather_dequant_bf16_kernel<<<(h_total_reordered*kHiddenSize+255)/256, 256, 0, stream>>>((uint8_t*)hidden_states.data_ptr(), d_reordered_tokens.get(), (float*)hidden_states_scale.data_ptr(), a_bf16.get(), h_total_reordered, scale_t);
+
+  std::vector<int32_t> h_counts(kLocalExperts), h_offsets(kLocalExperts + 1);
+  CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), d_expert_counts.get(), kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+  CHECK_CUDA(cudaMemcpyAsync(h_offsets.data(), d_expert_offsets.get(), (kLocalExperts+1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+  CHECK_CUDA(cudaStreamSynchronize(stream));
+
+  std::vector<cutlass::gemm::GemmCoord> prob1, prob2;
+  std::vector<cutlass_grouped::ElementA*> ptr_A1, ptr_C2;
+  std::vector<cutlass_grouped::ElementB*> ptr_B1, ptr_B2;
+  std::vector<cutlass_grouped::ElementC*> ptr_C1, ptr_D1, ptr_D2;
+
+  for(int i=0; i<kLocalExperts; ++i) {
+    if(h_counts[i] <= 0) continue;
+    prob1.push_back({(int)h_counts[i], (int)(2*kIntermediateSize), (int)kHiddenSize});
+    ptr_A1.push_back(a_bf16.get() + (int64_t)h_offsets[i] * kHiddenSize);
+    ptr_B1.push_back(w13_bf16.get() + (int64_t)i * 2 * kIntermediateSize * kHiddenSize);
+    ptr_C1.push_back(g1.get() + (int64_t)h_offsets[i] * 2 * kIntermediateSize);
+    ptr_D1.push_back(g1.get() + (int64_t)h_offsets[i] * 2 * kIntermediateSize);
+
+    prob2.push_back({(int)h_counts[i], (int)kHiddenSize, (int)kIntermediateSize});
+    ptr_C2.push_back(c_bf16.get() + (int64_t)h_offsets[i] * kIntermediateSize);
+    ptr_B2.push_back(w2_bf16.get() + (int64_t)i * kHiddenSize * kIntermediateSize);
+    ptr_D2.push_back(o_grouped.get() + (int64_t)h_offsets[i] * kHiddenSize);
   }
+
+  AsyncBuffer<cutlass::gemm::GemmCoord> d_prob1(prob1.size(), stream), d_prob2(prob2.size(), stream);
+  AsyncBuffer<cutlass_grouped::ElementA*> d_ptrA1(ptr_A1.size(), stream), d_ptrC2(ptr_C2.size(), stream);
+  AsyncBuffer<cutlass_grouped::ElementB*> d_ptrB1(ptr_B1.size(), stream), d_ptrB2(ptr_B2.size(), stream);
+  AsyncBuffer<cutlass_grouped::ElementC*> d_ptrC1(ptr_C1.size(), stream), d_ptrD1(ptr_D1.size(), stream), d_ptrD2(ptr_D2.size(), stream);
+
+  CHECK_CUDA(cudaMemcpyAsync(d_prob1.get(), prob1.data(), prob1.size() * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrA1.get(), ptr_A1.data(), ptr_A1.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrB1.get(), ptr_B1.data(), ptr_B1.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrC1.get(), ptr_C1.data(), ptr_C1.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrD1.get(), ptr_D1.data(), ptr_D1.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+
+  RunGroupedGemm(d_prob1.get(), prob1.data(), d_ptrA1.get(), d_ptrB1.get(), d_ptrC1.get(), d_ptrD1.get(), prob1.size(), kHiddenSize, 2*kIntermediateSize, stream);
+  swiglu_bf16_kernel<<<(h_total_reordered * kIntermediateSize + 255) / 256, 256, 0, stream>>>(g1.get(), c_bf16.get(), h_total_reordered);
+
+  CHECK_CUDA(cudaMemcpyAsync(d_prob2.get(), prob2.data(), prob2.size() * sizeof(cutlass::gemm::GemmCoord), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrC2.get(), ptr_C2.data(), ptr_C2.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrB2.get(), ptr_B2.data(), ptr_B2.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(d_ptrD2.get(), ptr_D2.data(), ptr_D2.size() * sizeof(void*), cudaMemcpyHostToDevice, stream));
+
+  RunGroupedGemm(d_prob2.get(), prob2.data(), d_ptrC2.get(), d_ptrB2.get(), d_ptrD2.get(), d_ptrD2.get(), prob2.size(), kIntermediateSize, kHiddenSize, stream);
+  optimized_scatter_add_kernel<<<(h_total_reordered * kHiddenSize + 255) / 256, 256, 0, stream>>>(o_grouped.get(), d_reordered_tokens.get(), w.get(), o_f32.get(), h_total_reordered, (int32_t)local_expert_offset, d_expert_offsets.get());
+
   cast_output_kernel<<<(t*kHiddenSize+255)/256, 256, 0, stream>>>(o_f32.get(), (__nv_bfloat16*)output_tensor.data_ptr(), t*kHiddenSize);
   CHECK_CUDA(cudaStreamSynchronize(stream));
   return output_tensor;
