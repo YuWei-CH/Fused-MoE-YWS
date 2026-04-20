@@ -196,29 +196,6 @@ __global__ void fused_gather_dequant_f32_kernel(const uint8_t* src, const int32_
   dst[idx] = fp8_e4m3_to_float(src[(int64_t)token * kHiddenSize + col]) * scale;
 }
 
-// Grouped Dequant (BF16)
-__global__ void dequant_weights_to_bf16_kernel(const uint8_t* src, const float* scale, cutlass::bfloat16_t* dst, int64_t num_experts, int64_t n, int64_t k) {
-  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t expert_size = n * k;
-  if (idx >= num_experts * expert_size) return;
-  int64_t ex = idx / expert_size; int64_t off = idx % expert_size;
-  int64_t row = off / k; int64_t col = off % k;
-  int64_t n_blks = n / kBlock; int64_t k_blks = k / kBlock;
-  float val = fp8_e4m3_to_float(src[idx]) * scale[ex * n_blks * k_blks + (row / kBlock) * k_blks + (col / kBlock)];
-  dst[idx] = cutlass::bfloat16_t(val);
-}
-
-__global__ void fused_gather_dequant_bf16_kernel(const uint8_t* src, const int32_t* token_idx, const float* scale_src, cutlass::bfloat16_t* dst, int64_t m, int64_t scale_t) {
-  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= m * kHiddenSize) return;
-  int64_t row = idx / kHiddenSize; int64_t col = idx % kHiddenSize;
-  int32_t token = token_idx[row];
-  if (token < 0) { dst[idx] = cutlass::bfloat16_t(0.0f); return; }
-  float scale = scale_src[(int64_t)(col / kBlock) * scale_t + token];
-  float val = fp8_e4m3_to_float(src[(int64_t)token * kHiddenSize + col]) * scale;
-  dst[idx] = cutlass::bfloat16_t(val);
-}
-
 __global__ void swiglu_f32_kernel(const float* g1, float* c, int64_t total_rows) {
   int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total_rows * kIntermediateSize) return;
@@ -226,11 +203,6 @@ __global__ void swiglu_f32_kernel(const float* g1, float* c, int64_t total_rows)
   float x1 = g1[row * 2 * kIntermediateSize + col];
   float x2 = g1[row * 2 * kIntermediateSize + kIntermediateSize + col];
   c[idx] = x1 * (x2 / (1.0f + expf(-x2)));
-}
-
-__global__ void cast_f32_to_bf16_kernel(const float* src, cutlass::bfloat16_t* dst, int64_t total) {
-  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < total) dst[idx] = cutlass::bfloat16_t(src[idx]);
 }
 
 __global__ void optimized_scatter_add_kernel(const float* o, const int32_t* token_idx, const int32_t* le_idx, const float* weights, float* output, int64_t total_reordered, int32_t local_expert_offset) {
@@ -344,20 +316,12 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   AsyncBuffer<float> w13_f32(kLocalExperts * 2 * kIntermediateSize * kHiddenSize, stream);
   AsyncBuffer<float> w2_f32(kLocalExperts * kHiddenSize * kIntermediateSize, stream);
   
-  AsyncBuffer<cutlass::bfloat16_t> a_bf16(h_total_reordered * kHiddenSize, stream);
-  AsyncBuffer<cutlass::bfloat16_t> c_bf16(h_total_reordered * kIntermediateSize, stream);
-  AsyncBuffer<cutlass::bfloat16_t> w13_bf16(kLocalExperts * 2 * kIntermediateSize * kHiddenSize, stream);
-  AsyncBuffer<cutlass::bfloat16_t> w2_bf16(kLocalExperts * kHiddenSize * kIntermediateSize, stream);
   AsyncBuffer<float> o_grouped_f32(h_total_reordered * kHiddenSize, stream); // CRITICAL FIX: Sized correctly for 8x token expansion
 
   // Dequantization
   fused_gather_dequant_f32_kernel<<<(h_total_reordered*kHiddenSize+255)/256, 256, 0, stream>>>((uint8_t*)hidden_states.data_ptr(), d_reordered_tokens.get(), (float*)hidden_states_scale.data_ptr(), a_f32.get(), h_total_reordered, scale_t);
   dequant_weights_to_f32_kernel<<<(w13_f32.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm1_weights.data_ptr(), (float*)gemm1_weights_scale.data_ptr(), w13_f32.get(), kLocalExperts, 2*kIntermediateSize, kHiddenSize);
   dequant_weights_to_f32_kernel<<<(w2_f32.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm2_weights.data_ptr(), (float*)gemm2_weights_scale.data_ptr(), w2_f32.get(), kLocalExperts, kHiddenSize, kIntermediateSize);
-
-  fused_gather_dequant_bf16_kernel<<<(h_total_reordered*kHiddenSize+255)/256, 256, 0, stream>>>((uint8_t*)hidden_states.data_ptr(), d_reordered_tokens.get(), (float*)hidden_states_scale.data_ptr(), a_bf16.get(), h_total_reordered, scale_t);
-  dequant_weights_to_bf16_kernel<<<(w13_bf16.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm1_weights.data_ptr(), (float*)gemm1_weights_scale.data_ptr(), w13_bf16.get(), kLocalExperts, 2*kIntermediateSize, kHiddenSize);
-  dequant_weights_to_bf16_kernel<<<(w2_bf16.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm2_weights.data_ptr(), (float*)gemm2_weights_scale.data_ptr(), w2_bf16.get(), kLocalExperts, kHiddenSize, kIntermediateSize);
 
   // HYBRID DISPATCH: GEMM1
   const int THRESHOLD = 128;
@@ -400,7 +364,6 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   }
 
   swiglu_f32_kernel<<<(h_total_reordered * kIntermediateSize + 255) / 256, 256, 0, stream>>>(g1_f32.get(), c_f32.get(), h_total_reordered);
-  cast_f32_to_bf16_kernel<<<(h_total_reordered * kIntermediateSize + 255) / 256, 256, 0, stream>>>(c_f32.get(), c_bf16.get(), h_total_reordered * kIntermediateSize);
 
   // HYBRID DISPATCH: GEMM2
   std::vector<cutlass::gemm::GemmCoord> prob2;
