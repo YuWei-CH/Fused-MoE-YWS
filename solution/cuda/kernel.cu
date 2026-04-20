@@ -88,12 +88,9 @@ template <typename T> struct AsyncBuffer {
 };
 
 __device__ inline float fp8_e4m3_to_float(uint8_t x) {
-  int s = (x >> 7);
-  int e = (x >> 3) & 0xf;
-  int m = x & 0x7;
-  if (e == 0) return (s ? -1.0f : 1.0f) * (m * 0.0009765625f);
-  if (e == 15 && m == 7) return NAN;
-  return (s ? -1.0f : 1.0f) * ldexpf((float)(8 + m), e - 10);
+  __nv_fp8_e4m3 v;
+  v.__x = x;
+  return static_cast<float>(v);
 }
 
 __global__ void sigmoid_bias_kernel(const float* logits, const __nv_bfloat16* bias, float* s,
@@ -292,19 +289,19 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   CHECK_CUDA(cudaMemsetAsync(d_expert_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
   CHECK_CUDA(cudaMemsetAsync(d_tmp_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
   count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(tk_idx.get(), d_expert_counts.get(), t, (int32_t)local_expert_offset);
-  
-  thrust::device_ptr<int32_t> dev_counts_ptr(d_expert_counts.get());
-  thrust::device_ptr<int32_t> dev_offsets_ptr(d_expert_offsets.get());
-  thrust::exclusive_scan(thrust::cuda::par.on(stream), dev_counts_ptr, dev_counts_ptr + kLocalExperts + 1, dev_offsets_ptr);
-  
-  reorder_tokens_kernel<<<t, 1, 0, stream>>>(tk_idx.get(), d_expert_offsets.get(), d_tmp_counts.get(), d_reordered_tokens.get(), d_reordered_le.get(), t, (int32_t)local_expert_offset);
-
-  int32_t h_total_reordered;
-  CHECK_CUDA(cudaMemcpyAsync(&h_total_reordered, d_expert_offsets.get() + kLocalExperts, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
   std::vector<int32_t> h_counts(kLocalExperts), h_offsets(kLocalExperts + 1);
   CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), d_expert_counts.get(), kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-  CHECK_CUDA(cudaMemcpyAsync(h_offsets.data(), d_expert_offsets.get(), (kLocalExperts+1) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
   CHECK_CUDA(cudaStreamSynchronize(stream));
+
+  h_offsets[0] = 0;
+  for (int i = 0; i < kLocalExperts; ++i) {
+    h_offsets[i + 1] = h_offsets[i] + h_counts[i];
+  }
+  int32_t h_total_reordered = h_offsets[kLocalExperts];
+
+  CHECK_CUDA(cudaMemcpyAsync(d_expert_offsets.get(), h_offsets.data(), (kLocalExperts + 1) * sizeof(int32_t),
+                             cudaMemcpyHostToDevice, stream));
+  reorder_tokens_kernel<<<t, 1, 0, stream>>>(tk_idx.get(), d_expert_offsets.get(), d_tmp_counts.get(), d_reordered_tokens.get(), d_reordered_le.get(), t, (int32_t)local_expert_offset);
 
   if (h_total_reordered == 0) { cast_output_kernel<<<(t*kHiddenSize+255)/256, 256, 0, stream>>>(o_f32.get(), (__nv_bfloat16*)output_tensor.data_ptr(), t*kHiddenSize); CHECK_CUDA(cudaStreamSynchronize(stream)); return output_tensor; }
 
