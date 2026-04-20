@@ -69,12 +69,11 @@ PHASE2_GEMM2_CANDIDATES = [
 ]
 
 THRESHOLD_CANDIDATES = [
-    992,
-    960,
-    928,
-    896,
-    832,
-    768,
+    32,
+    64,
+    128,
+    256,
+    512,
 ]
 
 
@@ -259,7 +258,7 @@ def sweep_phase(phase: str) -> None:
         ]
     else:
         candidates = [
-            (original.gemm1, original.gemm2, threshold, original.gemm2_threshold)
+            (original.gemm1, original.gemm2, threshold, threshold)
             for threshold in THRESHOLD_CANDIDATES
         ]
 

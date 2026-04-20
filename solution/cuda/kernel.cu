@@ -324,7 +324,7 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   dequant_weights_to_f32_kernel<<<(w2_f32.count+255)/256, 256, 0, stream>>>((uint8_t*)gemm2_weights.data_ptr(), (float*)gemm2_weights_scale.data_ptr(), w2_f32.get(), kLocalExperts, kHiddenSize, kIntermediateSize);
 
   // HYBRID DISPATCH: GEMM1
-  const int THRESHOLD = 128;
+  const int THRESHOLD1 = tile_config::kLargeGemm1TensorCoreThreshold;
   std::vector<cutlass::gemm::GemmCoord> prob1;
   std::vector<cutlass_grouped::ElementA*> ptr_A1;
   std::vector<cutlass_grouped::ElementB*> ptr_B1;
@@ -332,7 +332,7 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
 
   for(int i=0; i<kLocalExperts; ++i) {
     if(h_counts[i] <= 0) continue;
-    if (h_counts[i] < THRESHOLD) {
+    if (h_counts[i] < THRESHOLD1) {
         // SIMT path for small buckets
         RunGemmF32(a_f32.get() + (int64_t)h_offsets[i] * kHiddenSize, 
                    w13_f32.get() + (int64_t)i * 2 * kIntermediateSize * kHiddenSize,
@@ -366,6 +366,7 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
   swiglu_f32_kernel<<<(h_total_reordered * kIntermediateSize + 255) / 256, 256, 0, stream>>>(g1_f32.get(), c_f32.get(), h_total_reordered);
 
   // HYBRID DISPATCH: GEMM2
+  const int THRESHOLD2 = tile_config::kLargeGemm2TensorCoreThreshold;
   std::vector<cutlass::gemm::GemmCoord> prob2;
   std::vector<cutlass_grouped::ElementA*> ptr_C2;
   std::vector<cutlass_grouped::ElementB*> ptr_B2;
@@ -373,7 +374,7 @@ tvm::ffi::Tensor kernel(tvm::ffi::Tensor routing_logits, tvm::ffi::Tensor routin
 
   for(int i=0; i<kLocalExperts; ++i) {
     if(h_counts[i] <= 0) continue;
-    if (h_counts[i] < THRESHOLD) {
+    if (h_counts[i] < THRESHOLD2) {
         RunGemmF32(c_f32.get() + (int64_t)h_offsets[i] * kIntermediateSize, 
                    w2_f32.get() + (int64_t)i * kHiddenSize * kIntermediateSize,
                    o_grouped_f32.get() + (int64_t)h_offsets[i] * kHiddenSize,

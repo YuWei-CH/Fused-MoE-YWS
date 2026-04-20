@@ -49,7 +49,7 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume}, max_containers=10)
 def run_benchmark(
     solution: Solution,
     config: BenchmarkConfig = None,
@@ -199,13 +199,40 @@ def main(
             enabled.append("timing")
         print(f"Kernel debug enabled: {', '.join(enabled)}")
         print("Using reduced benchmark config for diagnostics: warmup=0, iterations=1, trials=1")
-    results = run_benchmark.remote(
-        solution,
-        max_workloads=max_workloads,
-        workload_uuid=workload_uuid,
-        debug_histogram=debug_histogram,
-        debug_timing=debug_timing,
-    )
+    
+    uuids = []
+    if not workload_uuid:
+        workload_file = PROJECT_ROOT.parent / "mlsys26-contest" / "workloads" / "moe" / f"{solution.definition}.jsonl"
+        if workload_file.exists():
+            with open(workload_file) as f:
+                for line in f:
+                    data = json.loads(line)
+                    uuids.append(data["workload"]["uuid"])
+        else:
+            print(f"Warning: {workload_file} not found, running without splitting")
+            uuids = [""]
+    else:
+        uuids = [workload_uuid]
+        
+    if max_workloads > 0 and uuids != [""]:
+        uuids = uuids[:max_workloads]
+
+    print(f"Running {len(uuids)} task(s) in parallel on Modal B200...")
+    
+    results = {}
+    for res in run_benchmark.map(
+        [solution] * len(uuids),
+        [None] * len(uuids),
+        [0] * len(uuids), # max_workloads already handled locally
+        uuids,
+        [debug_histogram] * len(uuids),
+        [debug_timing] * len(uuids)
+    ):
+        if res:
+            for def_name, traces in res.items():
+                if def_name not in results:
+                    results[def_name] = {}
+                results[def_name].update(traces)
 
     if not results:
         print("No results returned!")
