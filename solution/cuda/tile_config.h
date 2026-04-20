@@ -12,7 +12,7 @@ namespace tile_config
     inline constexpr int kGemm2TileN = 32;
     inline constexpr int kGemm2TileK = 64;
 
-    inline constexpr int kLargeGemm1TensorCoreThreshold = 780;
-    inline constexpr int kLargeGemm2TensorCoreThreshold = 780;
+    inline constexpr int kLargeGemm1TensorCoreThreshold = 1;
+    inline constexpr int kLargeGemm2TensorCoreThreshold = 1;
 
 } // namespace tile_config
