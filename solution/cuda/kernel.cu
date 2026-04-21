@@ -1111,13 +1111,18 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
     h_offsets[i + 1] = h_offsets[i] + h_counts[i];
   }
   int32_t total_reordered = h_offsets[kLocalExperts];
-  std::vector<int32_t> active_experts;
-  std::vector<int32_t> active_expert_slots(kLocalExperts, -1);
-  active_experts.reserve(kLocalExperts);
+  std::vector<int32_t> grouped_gemm1_experts;
+  std::vector<int32_t> grouped_gemm2_experts;
+  std::vector<int32_t> grouped_gemm1_slots(kLocalExperts, -1);
+  std::vector<int32_t> grouped_gemm2_slots(kLocalExperts, -1);
   for (int i = 0; i < kLocalExperts; ++i) {
-    if (h_counts[i] > 0) {
-      active_expert_slots[i] = static_cast<int32_t>(active_experts.size());
-      active_experts.push_back(i);
+    if (h_counts[i] >= kGroupedGemm1Threshold) {
+      grouped_gemm1_slots[i] = static_cast<int32_t>(grouped_gemm1_experts.size());
+      grouped_gemm1_experts.push_back(i);
+    }
+    if (h_counts[i] >= kGroupedGemm2Threshold) {
+      grouped_gemm2_slots[i] = static_cast<int32_t>(grouped_gemm2_experts.size());
+      grouped_gemm2_experts.push_back(i);
     }
   }
   CHECK_CUDA(cudaMemcpyAsync(d_expert_offsets.get(), h_offsets.data(),
@@ -1137,10 +1142,14 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
   AsyncBuffer<float> g1_f32(static_cast<size_t>(total_reordered) * 2 * kIntermediateSize, stream);
   AsyncBuffer<float> c_f32(static_cast<size_t>(total_reordered) * kIntermediateSize, stream);
   AsyncBuffer<float> a_f32(static_cast<size_t>(total_reordered) * kHiddenSize, stream);
-  AsyncBuffer<float> w13_f32(
-      static_cast<size_t>(active_experts.size()) * 2 * kIntermediateSize * kHiddenSize, stream);
-  AsyncBuffer<float> w2_f32(
-      static_cast<size_t>(active_experts.size()) * kHiddenSize * kIntermediateSize, stream);
+  AsyncBuffer<float> w13_grouped_f32(static_cast<size_t>(grouped_gemm1_experts.size()) *
+                                         2 * kIntermediateSize * kHiddenSize,
+                                     stream);
+  AsyncBuffer<float> w2_grouped_f32(static_cast<size_t>(grouped_gemm2_experts.size()) *
+                                        kHiddenSize * kIntermediateSize,
+                                    stream);
+  AsyncBuffer<float> w13_small_tmp(2 * kIntermediateSize * kHiddenSize, stream);
+  AsyncBuffer<float> w2_small_tmp(kHiddenSize * kIntermediateSize, stream);
   AsyncBuffer<float> o_grouped_f32(static_cast<size_t>(total_reordered) * kHiddenSize, stream);
 
   fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
@@ -1150,9 +1159,9 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
       static_cast<const float*>(hidden_states_scale.data_ptr()), a_f32.get(), total_reordered,
       scale_t);
   CHECK_CUDA(cudaGetLastError());
-  for (int32_t active_idx = 0; active_idx < static_cast<int32_t>(active_experts.size());
-       ++active_idx) {
-    int32_t local_expert = active_experts[static_cast<size_t>(active_idx)];
+  for (int32_t grouped_idx = 0; grouped_idx < static_cast<int32_t>(grouped_gemm1_experts.size());
+       ++grouped_idx) {
+    int32_t local_expert = grouped_gemm1_experts[static_cast<size_t>(grouped_idx)];
     dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize +
                                          255) /
                                         256,
@@ -1162,11 +1171,15 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
         static_cast<const float*>(gemm1_weights_scale.data_ptr()) +
             static_cast<int64_t>(local_expert) * ((2 * kIntermediateSize) / kBlock) *
                 (kHiddenSize / kBlock),
-        w13_f32.get() +
-            static_cast<int64_t>(active_idx) * 2 * kIntermediateSize * kHiddenSize,
+        w13_grouped_f32.get() +
+            static_cast<int64_t>(grouped_idx) * 2 * kIntermediateSize * kHiddenSize,
         1, 2 * kIntermediateSize, kHiddenSize);
     CHECK_CUDA(cudaGetLastError());
+  }
 
+  for (int32_t grouped_idx = 0; grouped_idx < static_cast<int32_t>(grouped_gemm2_experts.size());
+       ++grouped_idx) {
+    int32_t local_expert = grouped_gemm2_experts[static_cast<size_t>(grouped_idx)];
     dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(kHiddenSize) * kIntermediateSize +
                                          255) /
                                         256,
@@ -1176,7 +1189,8 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
         static_cast<const float*>(gemm2_weights_scale.data_ptr()) +
             static_cast<int64_t>(local_expert) * (kHiddenSize / kBlock) *
                 (kIntermediateSize / kBlock),
-        w2_f32.get() + static_cast<int64_t>(active_idx) * kHiddenSize * kIntermediateSize, 1,
+        w2_grouped_f32.get() + static_cast<int64_t>(grouped_idx) * kHiddenSize * kIntermediateSize,
+        1,
         kHiddenSize, kIntermediateSize);
     CHECK_CUDA(cudaGetLastError());
   }
@@ -1191,19 +1205,29 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
     if (h_counts[i] <= 0) {
       continue;
     }
-    int32_t active_idx = active_expert_slots[i];
     if (h_counts[i] < kGroupedGemm1Threshold) {
+      dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize +
+                                           255) /
+                                          256,
+                                      256, 0, stream>>>(
+          static_cast<const __nv_fp8_e4m3*>(gemm1_weights.data_ptr()) +
+              static_cast<int64_t>(i) * 2 * kIntermediateSize * kHiddenSize,
+          static_cast<const float*>(gemm1_weights_scale.data_ptr()) +
+              static_cast<int64_t>(i) * ((2 * kIntermediateSize) / kBlock) *
+                  (kHiddenSize / kBlock),
+          w13_small_tmp.get(), 1, 2 * kIntermediateSize, kHiddenSize);
+      CHECK_CUDA(cudaGetLastError());
       RunGemmF32(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
-                 w13_f32.get() +
-                     static_cast<int64_t>(active_idx) * 2 * kIntermediateSize * kHiddenSize,
+                 w13_small_tmp.get(),
                  g1_f32.get() + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
                  h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
     } else {
+      int32_t grouped_idx = grouped_gemm1_slots[i];
       prob1.push_back({h_counts[i], static_cast<int>(2 * kIntermediateSize),
                        static_cast<int>(kHiddenSize)});
       ptr_a1.push_back(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
-      ptr_b1.push_back(w13_f32.get() +
-                       static_cast<int64_t>(active_idx) * 2 * kIntermediateSize * kHiddenSize);
+      ptr_b1.push_back(w13_grouped_f32.get() +
+                       static_cast<int64_t>(grouped_idx) * 2 * kIntermediateSize * kHiddenSize);
       ptr_c1.push_back(g1_f32.get() + static_cast<int64_t>(h_offsets[i]) *
                                          2 * kIntermediateSize);
       ptr_d1.push_back(g1_f32.get() + static_cast<int64_t>(h_offsets[i]) *
@@ -1249,19 +1273,28 @@ void RunGroupedWorkloadPipeline(const ffi::TensorView& hidden_states,
     if (h_counts[i] <= 0) {
       continue;
     }
-    int32_t active_idx = active_expert_slots[i];
     if (h_counts[i] < kGroupedGemm2Threshold) {
+      dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(kHiddenSize) * kIntermediateSize +
+                                           255) /
+                                          256,
+                                      256, 0, stream>>>(
+          static_cast<const __nv_fp8_e4m3*>(gemm2_weights.data_ptr()) +
+              static_cast<int64_t>(i) * kHiddenSize * kIntermediateSize,
+          static_cast<const float*>(gemm2_weights_scale.data_ptr()) +
+              static_cast<int64_t>(i) * (kHiddenSize / kBlock) * (kIntermediateSize / kBlock),
+          w2_small_tmp.get(), 1, kHiddenSize, kIntermediateSize);
+      CHECK_CUDA(cudaGetLastError());
       RunGemmF32(c_f32.get() + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize,
-                 w2_f32.get() +
-                     static_cast<int64_t>(active_idx) * kHiddenSize * kIntermediateSize,
+                 w2_small_tmp.get(),
                  o_grouped_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
                  h_counts[i], kHiddenSize, kIntermediateSize, stream);
     } else {
+      int32_t grouped_idx = grouped_gemm2_slots[i];
       prob2.push_back(
           {h_counts[i], static_cast<int>(kHiddenSize), static_cast<int>(kIntermediateSize)});
       ptr_a2.push_back(c_f32.get() + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize);
-      ptr_b2.push_back(w2_f32.get() +
-                       static_cast<int64_t>(active_idx) * kHiddenSize * kIntermediateSize);
+      ptr_b2.push_back(w2_grouped_f32.get() +
+                       static_cast<int64_t>(grouped_idx) * kHiddenSize * kIntermediateSize);
       ptr_d2.push_back(o_grouped_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
     }
   }
