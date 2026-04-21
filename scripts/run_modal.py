@@ -11,7 +11,6 @@ Setup (one-time):
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -61,16 +60,10 @@ def run_benchmark(
     config: BenchmarkConfig = None,
     max_workloads: int = 0,
     workload_uuid: str = "",
-    debug_histogram: bool = False,
-    debug_timing: bool = False,
 ) -> dict:
     """Run benchmark on Modal B200 and return results."""
-    debug_mode = debug_histogram or debug_timing
     if config is None:
-        if debug_mode:
-            config = BenchmarkConfig(warmup_runs=0, iterations=1, num_trials=1)
-        else:
-            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     def get_workload_uuid(item) -> str | None:
         if hasattr(item, "uuid"):
@@ -79,15 +72,6 @@ def run_benchmark(
         if workload is not None and hasattr(workload, "uuid"):
             return workload.uuid
         return None
-
-    if debug_histogram:
-        os.environ["MOE_DEBUG_HISTOGRAM"] = "1"
-    else:
-        os.environ.pop("MOE_DEBUG_HISTOGRAM", None)
-    if debug_timing:
-        os.environ["MOE_DEBUG_TIMING"] = "1"
-    else:
-        os.environ.pop("MOE_DEBUG_TIMING", None)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -178,8 +162,6 @@ def print_results(results: dict):
 def main(
     max_workloads: int = 0,
     workload_uuid: str = "",
-    debug_histogram: bool = False,
-    debug_timing: bool = False,
     json_out: str = "",
 ):
     """Pack solution and run benchmark on Modal."""
@@ -194,17 +176,9 @@ def main(
 
     print("\nRunning benchmark on Modal B200...")
     if max_workloads > 0:
-        print(f"Debug mode: limiting run to {max_workloads} workload(s)")
+        print(f"Limiting run to {max_workloads} workload(s)")
     if workload_uuid:
         print(f"Filtering to workload: {workload_uuid}")
-    if debug_histogram or debug_timing:
-        enabled = []
-        if debug_histogram:
-            enabled.append("histogram")
-        if debug_timing:
-            enabled.append("timing")
-        print(f"Kernel debug enabled: {', '.join(enabled)}")
-        print("Using reduced benchmark config for diagnostics: warmup=0, iterations=1, trials=1")
     workload_uuids: list[str]
     if workload_uuid:
         workload_uuids = [workload_uuid]
@@ -239,8 +213,6 @@ def main(
         [None] * len(workload_uuids),
         [0] * len(workload_uuids),
         workload_uuids,
-        [debug_histogram] * len(workload_uuids),
-        [debug_timing] * len(workload_uuids),
     ):
         if not res:
             continue
