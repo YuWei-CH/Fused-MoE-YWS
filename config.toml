@@ -1,7 +1,8 @@
 [solution]
-name = "Self-Driving Kernel-solution-v1"
+name = "Self-Driving Kernel-mix-workload-v1"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "Self-Driving Kernel"
+description = "Hybrid MoE kernel for B200: retains the original bucketed path for small and medium workloads, and dispatches very large workloads to an expert-reordered grouped-GEMM pipeline."
 
 [build]
 language = "cuda"
