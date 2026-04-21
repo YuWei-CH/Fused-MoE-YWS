@@ -203,6 +203,8 @@ namespace
     return (value + alignment - 1) / alignment * alignment;
   }
 
+  // A tiny bump allocator over one cudaMallocAsync-backed buffer. This keeps per-call
+  // workspace management readable without committing to a large global workspace API.
   class WorkspaceArena
   {
   public:
@@ -236,6 +238,12 @@ namespace
     int32_t *reordered_tokens = nullptr;
     int32_t *reordered_local_experts = nullptr;
     int32_t *total_rows = nullptr;
+  };
+
+  struct GroupedExpertPlan
+  {
+    std::vector<int32_t> experts;
+    std::vector<int32_t> slots;
   };
 
   __device__ inline float fp8_to_float(__nv_fp8_e4m3 value)
@@ -501,6 +509,54 @@ namespace
     return scan_workspace_size;
   }
 
+  size_t GetDeviceOnlyWorkspaceBytes(int32_t max_rows, size_t scan_workspace_size)
+  {
+    return sizeof(int32_t) *
+               static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 + 2 * max_rows) +
+           scan_workspace_size +
+           sizeof(float) * static_cast<size_t>(max_rows) *
+               (2 * kHiddenSize + 3 * kIntermediateSize);
+  }
+
+  size_t GetGroupedPrepWorkspaceBytes(int32_t max_rows, size_t scan_workspace_size)
+  {
+    return sizeof(int32_t) *
+               static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 + 2 * max_rows) +
+           scan_workspace_size;
+  }
+
+  size_t GetGroupedComputeWorkspaceBytes(int32_t total_rows, size_t grouped_gemm1_count,
+                                         size_t grouped_gemm2_count)
+  {
+    return sizeof(float) * static_cast<size_t>(total_rows) *
+               (2 * kIntermediateSize + kIntermediateSize + kHiddenSize + kHiddenSize) +
+           sizeof(float) * grouped_gemm1_count * 2 * kIntermediateSize * kHiddenSize +
+           sizeof(float) * grouped_gemm2_count * kHiddenSize * kIntermediateSize +
+           sizeof(float) * (2 * kIntermediateSize * kHiddenSize +
+                            kHiddenSize * kIntermediateSize) +
+           sizeof(int32_t) * (grouped_gemm1_count + grouped_gemm2_count);
+  }
+
+  GroupedExpertPlan BuildGroupedExpertPlan(const std::vector<int32_t> &expert_counts,
+                                           int32_t threshold)
+  {
+    GroupedExpertPlan plan;
+    plan.slots.assign(kLocalExperts, -1);
+    for (int32_t expert = 0; expert < kLocalExperts; ++expert)
+    {
+      if (expert_counts[expert] >= threshold)
+      {
+        plan.slots[expert] = static_cast<int32_t>(plan.experts.size());
+        plan.experts.push_back(expert);
+      }
+    }
+    return plan;
+  }
+
+  // Build the expert-local workload layout shared by both execution paths:
+  // 1) count local assignments
+  // 2) exclusive-scan counts into per-expert row offsets
+  // 3) reorder (token, expert) pairs into one contiguous row-major expert layout
   PreparedExpertWorkload PrepareExpertWorkload(const int32_t *topk_idx, int64_t t,
                                                int32_t local_expert_offset, int32_t max_rows,
                                                size_t scan_workspace_size,
@@ -604,6 +660,8 @@ namespace
       const __nv_fp8_e4m3 *__restrict__ gemm1_weights,
       const float *__restrict__ gemm1_weights_scale, float *__restrict__ g1)
   {
+    // Each block computes one [TileM x TileN] output tile for one local expert.
+    // We stage A and the dequantized weight tile in shared memory and accumulate in FP32.
     __shared__ float a_tile[TileM][TileK];
     __shared__ float b_tile[TileK][TileN + 1];
 
@@ -700,6 +758,7 @@ namespace
       const __nv_fp8_e4m3 *__restrict__ gemm2_weights,
       const float *__restrict__ gemm2_weights_scale, float *__restrict__ o)
   {
+    // Same structure as GEMM1, but for the second projection C @ W2^T.
     __shared__ float c_tile[TileM][TileK];
     __shared__ float b_tile[TileK][TileN + 1];
 
@@ -792,6 +851,8 @@ namespace
   void RunGemmF32(const float *a, const float *b, float *d, int m, int n, int k,
                   cudaStream_t stream)
   {
+    // Small-expert fallback in the grouped path. For tiny M, the launch/setup overhead of the
+    // grouped tensor-core kernel can dominate, so a simple SIMT GEMM remains competitive.
     using ElementA = float;
     using LayoutA = cutlass::layout::RowMajor;
     using ElementB = float;
@@ -815,6 +876,7 @@ namespace
                       cutlass_grouped_f32::ElementC **ptr_d, int expert_count, int k, int n,
                       cudaStream_t stream)
   {
+    // CUTLASS grouped GEMM for the large-expert subset in the grouped_workload path.
     using GemmGrouped = cutlass_grouped_f32::GemmGrouped;
     using LongIndex = typename GemmGrouped::LayoutA::Stride::LongIndex;
 
@@ -883,19 +945,18 @@ namespace
                                     float *weights, float *output_fp32, int64_t t,
                                     int32_t local_expert_offset, cudaStream_t stream)
   {
+    // Small/medium-sequence path:
+    // keep all scheduling on device and run both GEMMs with the custom FP8 kernels.
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
-    size_t workspace_bytes = sizeof(int32_t) *
-                                 static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 +
-                                                     2 * max_rows) +
-                             scan_workspace_size +
-                             sizeof(float) * static_cast<size_t>(max_rows) *
-                                 (2 * kHiddenSize + 3 * kIntermediateSize);
+    size_t workspace_bytes = GetDeviceOnlyWorkspaceBytes(max_rows, scan_workspace_size);
     WorkspaceArena workspace(workspace_bytes, stream);
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &workspace, stream);
+    // The workspace packs:
+    // counts/offsets/reordered rows + A + G1 + C + O for the full local assignment set.
     float *a_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
     float *g1_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * 2 * kIntermediateSize);
     float *c_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kIntermediateSize);
@@ -935,13 +996,14 @@ namespace
       int32_t *topk_idx, float *weights, float *output_fp32, int64_t t,
       int32_t local_expert_offset, cudaStream_t stream)
   {
+    // Large-sequence path:
+    // reuse the same workload preparation, then split experts into:
+    // - small experts: dequantize one expert and run a SIMT GEMM
+    // - large experts: batch them into one CUTLASS grouped GEMM launch
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
-    size_t prep_workspace_bytes = sizeof(int32_t) *
-                                      static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 +
-                                                          2 * max_rows) +
-                                  scan_workspace_size;
+    size_t prep_workspace_bytes = GetGroupedPrepWorkspaceBytes(max_rows, scan_workspace_size);
     WorkspaceArena prep_workspace(prep_workspace_bytes, stream);
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
@@ -956,38 +1018,16 @@ namespace
                                stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
     int32_t total_reordered = h_offsets[kLocalExperts];
-    std::vector<int32_t> grouped_gemm1_experts;
-    std::vector<int32_t> grouped_gemm2_experts;
-    std::vector<int32_t> grouped_gemm1_slots(kLocalExperts, -1);
-    std::vector<int32_t> grouped_gemm2_slots(kLocalExperts, -1);
-    for (int i = 0; i < kLocalExperts; ++i)
-    {
-      if (h_counts[i] >= kGroupedGemm1Threshold)
-      {
-        grouped_gemm1_slots[i] = static_cast<int32_t>(grouped_gemm1_experts.size());
-        grouped_gemm1_experts.push_back(i);
-      }
-      if (h_counts[i] >= kGroupedGemm2Threshold)
-      {
-        grouped_gemm2_slots[i] = static_cast<int32_t>(grouped_gemm2_experts.size());
-        grouped_gemm2_experts.push_back(i);
-      }
-    }
+    GroupedExpertPlan grouped_gemm1 = BuildGroupedExpertPlan(h_counts, kGroupedGemm1Threshold);
+    GroupedExpertPlan grouped_gemm2 = BuildGroupedExpertPlan(h_counts, kGroupedGemm2Threshold);
 
     if (total_reordered == 0)
     {
       return;
     }
 
-    size_t compute_workspace_bytes =
-        sizeof(float) * static_cast<size_t>(total_reordered) *
-            (2 * kIntermediateSize + kIntermediateSize + kHiddenSize + kHiddenSize) +
-        sizeof(float) * static_cast<size_t>(grouped_gemm1_experts.size()) *
-            2 * kIntermediateSize * kHiddenSize +
-        sizeof(float) * static_cast<size_t>(grouped_gemm2_experts.size()) *
-            kHiddenSize * kIntermediateSize +
-        sizeof(float) * (2 * kIntermediateSize * kHiddenSize + kHiddenSize * kIntermediateSize) +
-        sizeof(int32_t) * (grouped_gemm1_experts.size() + grouped_gemm2_experts.size());
+    size_t compute_workspace_bytes = GetGroupedComputeWorkspaceBytes(
+        total_reordered, grouped_gemm1.experts.size(), grouped_gemm2.experts.size());
     WorkspaceArena compute_workspace(compute_workspace_bytes, stream);
     float *g1_f32 = compute_workspace.Alloc<float>(
         static_cast<size_t>(total_reordered) * 2 * kIntermediateSize);
@@ -996,17 +1036,17 @@ namespace
     float *a_f32 =
         compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kHiddenSize);
     float *w13_grouped_f32 = compute_workspace.Alloc<float>(
-        static_cast<size_t>(grouped_gemm1_experts.size()) * 2 * kIntermediateSize * kHiddenSize);
+        static_cast<size_t>(grouped_gemm1.experts.size()) * 2 * kIntermediateSize * kHiddenSize);
     float *w2_grouped_f32 = compute_workspace.Alloc<float>(
-        static_cast<size_t>(grouped_gemm2_experts.size()) * kHiddenSize * kIntermediateSize);
+        static_cast<size_t>(grouped_gemm2.experts.size()) * kHiddenSize * kIntermediateSize);
     float *w13_small_tmp = compute_workspace.Alloc<float>(2 * kIntermediateSize * kHiddenSize);
     float *w2_small_tmp = compute_workspace.Alloc<float>(kHiddenSize * kIntermediateSize);
     float *o_grouped_f32 =
         compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kHiddenSize);
     int32_t *d_grouped_gemm1_experts =
-        compute_workspace.Alloc<int32_t>(grouped_gemm1_experts.size());
+        compute_workspace.Alloc<int32_t>(grouped_gemm1.experts.size());
     int32_t *d_grouped_gemm2_experts =
-        compute_workspace.Alloc<int32_t>(grouped_gemm2_experts.size());
+        compute_workspace.Alloc<int32_t>(grouped_gemm2.experts.size());
 
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
                                           256,
@@ -1015,37 +1055,38 @@ namespace
         static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, total_reordered,
         scale_t);
     CHECK_CUDA(cudaGetLastError());
-    if (!grouped_gemm1_experts.empty())
+    if (!grouped_gemm1.experts.empty())
     {
-      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm1_experts, grouped_gemm1_experts.data(),
-                                 grouped_gemm1_experts.size() * sizeof(int32_t),
+      // Batch-dequantize the grouped experts into one contiguous expert-major weight buffer.
+      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm1_experts, grouped_gemm1.experts.data(),
+                                 grouped_gemm1.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
       dequant_selected_experts_to_f32_kernel<<<
-          (static_cast<int64_t>(grouped_gemm1_experts.size()) * 2 * kIntermediateSize *
+          (static_cast<int64_t>(grouped_gemm1.experts.size()) * 2 * kIntermediateSize *
                kHiddenSize +
            255) /
               256,
           256, 0, stream>>>(d_grouped_gemm1_experts,
                              static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
                              static_cast<const float *>(gemm1_weights_scale.data_ptr()),
-                             w13_grouped_f32, static_cast<int32_t>(grouped_gemm1_experts.size()),
+                             w13_grouped_f32, static_cast<int32_t>(grouped_gemm1.experts.size()),
                              2 * kIntermediateSize, kHiddenSize);
       CHECK_CUDA(cudaGetLastError());
     }
 
-    if (!grouped_gemm2_experts.empty())
+    if (!grouped_gemm2.experts.empty())
     {
-      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm2_experts, grouped_gemm2_experts.data(),
-                                 grouped_gemm2_experts.size() * sizeof(int32_t),
+      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm2_experts, grouped_gemm2.experts.data(),
+                                 grouped_gemm2.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
       dequant_selected_experts_to_f32_kernel<<<
-          (static_cast<int64_t>(grouped_gemm2_experts.size()) * kHiddenSize * kIntermediateSize +
+          (static_cast<int64_t>(grouped_gemm2.experts.size()) * kHiddenSize * kIntermediateSize +
            255) /
               256,
           256, 0, stream>>>(d_grouped_gemm2_experts,
                              static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
                              static_cast<const float *>(gemm2_weights_scale.data_ptr()),
-                             w2_grouped_f32, static_cast<int32_t>(grouped_gemm2_experts.size()),
+                             w2_grouped_f32, static_cast<int32_t>(grouped_gemm2.experts.size()),
                              kHiddenSize, kIntermediateSize);
       CHECK_CUDA(cudaGetLastError());
     }
@@ -1064,6 +1105,7 @@ namespace
       }
       if (h_counts[i] < kGroupedGemm1Threshold)
       {
+        // Small expert: materialize just one expert's weights and run the SIMT fallback.
         dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize +
                                          255) /
                                             256,
@@ -1081,7 +1123,8 @@ namespace
       }
       else
       {
-        int32_t grouped_idx = grouped_gemm1_slots[i];
+        // Large expert: enqueue it into the grouped GEMM descriptor arrays.
+        int32_t grouped_idx = grouped_gemm1.slots[i];
         prob1.push_back({h_counts[i], static_cast<int>(2 * kIntermediateSize),
                          static_cast<int>(kHiddenSize)});
         ptr_a1.push_back(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
@@ -1153,7 +1196,7 @@ namespace
       }
       else
       {
-        int32_t grouped_idx = grouped_gemm2_slots[i];
+        int32_t grouped_idx = grouped_gemm2.slots[i];
         prob2.push_back(
             {h_counts[i], static_cast<int>(kHiddenSize), static_cast<int>(kIntermediateSize)});
         ptr_a2.push_back(c_f32 + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize);
@@ -1270,6 +1313,8 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
                                               weights.get(), t, routed_scaling_factor);
   CHECK_CUDA(cudaGetLastError());
 
+  // Hybrid dispatch: small/medium sequences favor the fully device-side custom path, while
+  // large sequences amortize the grouped CUTLASS path well enough to offset host setup.
   if (t <= kHybridDispatchSeqLenThreshold)
   {
     RunDeviceOnlyGroupedPipeline(hidden_states, hidden_states_scale, gemm1_weights,
