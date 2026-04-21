@@ -23,6 +23,10 @@ namespace ffi = tvm::ffi;
 namespace
 {
 
+  // ---------------------------------------------------------------------------
+  // Global geometry and fixed submission-time tuning choices.
+  // ---------------------------------------------------------------------------
+
   // Fixed DeepSeek-V3 / contest geometry from the reference definition.
   constexpr int64_t kHiddenSize = 7168;
   constexpr int64_t kIntermediateSize = 2048;
@@ -84,6 +88,10 @@ namespace
             cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 4>::GemmKernel>;
 
   } // namespace cutlass_grouped_f32
+
+  // ---------------------------------------------------------------------------
+  // Validation and lightweight CUDA memory helpers.
+  // ---------------------------------------------------------------------------
 
   void CheckTensor(const ffi::TensorView &tensor, const char *name, int32_t ndim,
                    ffi::ShapeView expected_shape, DLDataType expected_dtype)
@@ -256,6 +264,12 @@ namespace
     return __bfloat162float(value);
   }
 
+  // ---------------------------------------------------------------------------
+  // Stage 1: routing.
+  // These kernels implement the reference DeepSeek routing logic:
+  // logits -> sigmoid/bias -> grouped top-k selection -> normalized expert weights.
+  // ---------------------------------------------------------------------------
+
   // Compute s = sigmoid(logits) and s_with_bias = s + bias.
   __global__ void sigmoid_bias_kernel(const float *routing_logits, const __nv_bfloat16 *routing_bias,
                                       float *s, float *s_with_bias, int64_t t)
@@ -404,6 +418,7 @@ namespace
   __global__ void count_expert_tokens_kernel(const int32_t *topk_idx, int32_t *expert_counts,
                                              int64_t t, int32_t local_expert_offset)
   {
+    // Count how many routed rows belong to each local expert on this rank.
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= t * kTopK)
     {
@@ -422,6 +437,7 @@ namespace
                                         int32_t *reordered_local_experts, int64_t t,
                                         int32_t local_expert_offset)
   {
+    // Expand each token's top-k routing decisions into a contiguous expert-major row layout.
     int64_t token_id = blockIdx.x;
     if (token_id >= t)
     {
@@ -439,52 +455,6 @@ namespace
         reordered_local_experts[pos] = local_expert;
       }
     }
-  }
-
-  __global__ void dequant_weights_to_f32_kernel(const __nv_fp8_e4m3 *src, const float *scale,
-                                                float *dst, int64_t num_experts, int64_t n,
-                                                int64_t k)
-  {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t expert_size = n * k;
-    if (idx >= num_experts * expert_size)
-    {
-      return;
-    }
-    int64_t expert = idx / expert_size;
-    int64_t offset = idx % expert_size;
-    int64_t row = offset / k;
-    int64_t col = offset % k;
-    int64_t n_blocks = n / kBlock;
-    int64_t k_blocks = k / kBlock;
-    int64_t scale_idx =
-        expert * n_blocks * k_blocks + (row / kBlock) * k_blocks + (col / kBlock);
-    dst[idx] = fp8_to_float(src[idx]) * scale[scale_idx];
-  }
-
-  __global__ void dequant_selected_experts_to_f32_kernel(const int32_t *expert_ids,
-                                                         const __nv_fp8_e4m3 *src,
-                                                         const float *scale, float *dst,
-                                                         int32_t num_selected, int64_t n,
-                                                         int64_t k)
-  {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t expert_size = n * k;
-    if (idx >= static_cast<int64_t>(num_selected) * expert_size)
-    {
-      return;
-    }
-    int32_t selected_slot = static_cast<int32_t>(idx / expert_size);
-    int32_t local_expert = expert_ids[selected_slot];
-    int64_t offset = idx % expert_size;
-    int64_t row = offset / k;
-    int64_t col = offset % k;
-    int64_t n_blocks = n / kBlock;
-    int64_t k_blocks = k / kBlock;
-    int64_t scale_idx = static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
-                        (row / kBlock) * k_blocks + (col / kBlock);
-    dst[idx] = fp8_to_float(src[static_cast<int64_t>(local_expert) * expert_size + offset]) *
-               scale[scale_idx];
   }
 
   __global__ void finalize_expert_offsets_kernel(const int32_t *expert_counts, int32_t *expert_offsets,
@@ -553,6 +523,12 @@ namespace
     return plan;
   }
 
+  // ---------------------------------------------------------------------------
+  // Stage 2: build the local expert workload.
+  // Convert token-level routing outputs into an expert-major row layout that both
+  // execution paths consume.
+  // ---------------------------------------------------------------------------
+
   // Build the expert-local workload layout shared by both execution paths:
   // 1) count local assignments
   // 2) exclusive-scan counts into per-expert row offsets
@@ -595,11 +571,19 @@ namespace
     return prepared;
   }
 
+  // ---------------------------------------------------------------------------
+  // Stage 3: materialize activations and merge results.
+  // These kernels transform reordered token rows into dense FP32 activations,
+  // apply the SwiGLU nonlinearity, and scatter expert outputs back to tokens.
+  // ---------------------------------------------------------------------------
+
   __global__ void fused_gather_dequant_f32_kernel(const __nv_fp8_e4m3 *src,
                                                   const int32_t *token_idx,
                                                   const float *scale_src, float *dst, int64_t m,
                                                   int64_t scale_t)
   {
+    // Gather hidden-state rows according to the reordered expert-major layout and
+    // dequantize them from FP8 block-scaled storage into FP32 GEMM inputs.
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= m * kHiddenSize)
     {
@@ -619,6 +603,7 @@ namespace
 
   __global__ void swiglu_f32_kernel(const float *g1, float *c, const int32_t *total_rows_ptr)
   {
+    // Apply the gate/up projection epilogue: swiglu(x1, x2) = x1 * silu(x2).
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int32_t total_rows = total_rows_ptr[0];
     if (idx >= static_cast<int64_t>(total_rows) * kIntermediateSize)
@@ -638,6 +623,7 @@ namespace
                                                const int32_t *total_rows_ptr,
                                                int32_t local_expert_offset)
   {
+    // Accumulate expert outputs back into the original token order with routing weights.
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int32_t total_reordered = total_rows_ptr[0];
     if (idx >= static_cast<int64_t>(total_reordered) * kHiddenSize)
@@ -651,6 +637,64 @@ namespace
         weights[static_cast<int64_t>(token) * kGlobalExperts + local_expert + local_expert_offset];
     atomicAdd(&output[static_cast<int64_t>(token) * kHiddenSize + (idx % kHiddenSize)],
               o[idx] * weight);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Stage 4: expert compute backends.
+  // The device_only path consumes FP8 weights directly inside custom kernels.
+  // The grouped_workload path dequantizes selected experts into FP32 and then
+  // dispatches either a small SIMT GEMM or a grouped CUTLASS GEMM.
+  // ---------------------------------------------------------------------------
+
+  __global__ void dequant_weights_to_f32_kernel(const __nv_fp8_e4m3 *src, const float *scale,
+                                                float *dst, int64_t num_experts, int64_t n,
+                                                int64_t k)
+  {
+    // Dequantize a contiguous set of experts from FP8 block-scaled weights into
+    // row-major FP32 weights for the grouped_workload path.
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t expert_size = n * k;
+    if (idx >= num_experts * expert_size)
+    {
+      return;
+    }
+    int64_t expert = idx / expert_size;
+    int64_t offset = idx % expert_size;
+    int64_t row = offset / k;
+    int64_t col = offset % k;
+    int64_t n_blocks = n / kBlock;
+    int64_t k_blocks = k / kBlock;
+    int64_t scale_idx =
+        expert * n_blocks * k_blocks + (row / kBlock) * k_blocks + (col / kBlock);
+    dst[idx] = fp8_to_float(src[idx]) * scale[scale_idx];
+  }
+
+  __global__ void dequant_selected_experts_to_f32_kernel(const int32_t *expert_ids,
+                                                         const __nv_fp8_e4m3 *src,
+                                                         const float *scale, float *dst,
+                                                         int32_t num_selected, int64_t n,
+                                                         int64_t k)
+  {
+    // Dequantize an arbitrary list of experts into a compact FP32 buffer used by
+    // the grouped GEMM path. expert_ids[selected_slot] defines which expert each
+    // destination slice corresponds to.
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t expert_size = n * k;
+    if (idx >= static_cast<int64_t>(num_selected) * expert_size)
+    {
+      return;
+    }
+    int32_t selected_slot = static_cast<int32_t>(idx / expert_size);
+    int32_t local_expert = expert_ids[selected_slot];
+    int64_t offset = idx % expert_size;
+    int64_t row = offset / k;
+    int64_t col = offset % k;
+    int64_t n_blocks = n / kBlock;
+    int64_t k_blocks = k / kBlock;
+    int64_t scale_idx = static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
+                        (row / kBlock) * k_blocks + (col / kBlock);
+    dst[idx] = fp8_to_float(src[static_cast<int64_t>(local_expert) * expert_size + offset]) *
+               scale[scale_idx];
   }
 
   template <int TileM, int TileN, int TileK>
@@ -952,6 +996,8 @@ namespace
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
     size_t workspace_bytes = GetDeviceOnlyWorkspaceBytes(max_rows, scan_workspace_size);
     WorkspaceArena workspace(workspace_bytes, stream);
+
+    // Step 1. Build the expert-major row layout for all local assignments.
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &workspace, stream);
@@ -962,17 +1008,20 @@ namespace
     float *c_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kIntermediateSize);
     float *o_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
 
+    // Step 2. Gather the routed token rows and dequantize activations to FP32.
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                       256, 0, stream>>>(
         static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
         static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, max_rows, scale_t);
     CHECK_CUDA(cudaGetLastError());
 
+    // Step 3. Run the two expert projections with the custom device-only FP8 kernels.
     LaunchGroupedFp8Gemm1<kGemm1TileM, kGemm1TileN, kGemm1TileK>(
         a_f32, prepared.expert_offsets, prepared.expert_counts,
         static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
         static_cast<const float *>(gemm1_weights_scale.data_ptr()), g1_f32, stream);
 
+    // Step 4. Apply SwiGLU between the two projections.
     swiglu_f32_kernel<<<(static_cast<int64_t>(max_rows) * kIntermediateSize + 255) / 256,
                         256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
@@ -982,6 +1031,7 @@ namespace
         static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
         static_cast<const float *>(gemm2_weights_scale.data_ptr()), o_f32, stream);
 
+    // Step 5. Scatter the reordered expert rows back into token-major output order.
     optimized_scatter_add_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                    256, 0, stream>>>(
         o_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights, output_fp32,
@@ -1005,10 +1055,13 @@ namespace
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
     size_t prep_workspace_bytes = GetGroupedPrepWorkspaceBytes(max_rows, scan_workspace_size);
     WorkspaceArena prep_workspace(prep_workspace_bytes, stream);
+
+    // Step 1. Build the shared expert-major row layout.
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &prep_workspace, stream);
 
+    // Step 2. Bring back expert row counts so the host can build grouped GEMM descriptors.
     std::vector<int32_t> h_counts(kLocalExperts);
     std::vector<int32_t> h_offsets(kLocalExperts + 1);
     CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), prepared.expert_counts,
@@ -1048,6 +1101,7 @@ namespace
     int32_t *d_grouped_gemm2_experts =
         compute_workspace.Alloc<int32_t>(grouped_gemm2.experts.size());
 
+    // Step 3. Gather and dequantize all routed activation rows once.
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
                                           256,
                                       256, 0, stream>>>(
@@ -1057,7 +1111,7 @@ namespace
     CHECK_CUDA(cudaGetLastError());
     if (!grouped_gemm1.experts.empty())
     {
-      // Batch-dequantize the grouped experts into one contiguous expert-major weight buffer.
+      // Step 4a. Materialize GEMM1 weights for the large-expert subset.
       CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm1_experts, grouped_gemm1.experts.data(),
                                  grouped_gemm1.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
@@ -1076,6 +1130,7 @@ namespace
 
     if (!grouped_gemm2.experts.empty())
     {
+      // Step 4b. Materialize GEMM2 weights for the large-expert subset.
       CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm2_experts, grouped_gemm2.experts.data(),
                                  grouped_gemm2.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
@@ -1097,6 +1152,8 @@ namespace
     std::vector<cutlass_grouped_f32::ElementC *> ptr_c1;
     std::vector<cutlass_grouped_f32::ElementC *> ptr_d1;
 
+    // Step 5. Execute GEMM1 using a mixed strategy:
+    // tiny experts use the SIMT fallback, large experts are packed into one grouped CUTLASS GEMM.
     for (int i = 0; i < kLocalExperts; ++i)
     {
       if (h_counts[i] <= 0)
@@ -1164,6 +1221,7 @@ namespace
                      2 * kIntermediateSize, stream);
     }
 
+    // Step 6. Apply SwiGLU after GEMM1 completes for all reordered rows.
     swiglu_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kIntermediateSize + 255) / 256,
                         256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
@@ -1172,6 +1230,8 @@ namespace
     std::vector<cutlass_grouped_f32::ElementA *> ptr_a2;
     std::vector<cutlass_grouped_f32::ElementB *> ptr_b2;
     std::vector<cutlass_grouped_f32::ElementC *> ptr_d2;
+
+    // Step 7. Execute GEMM2 with the same small-expert / large-expert split.
     for (int i = 0; i < kLocalExperts; ++i)
     {
       if (h_counts[i] <= 0)
@@ -1229,6 +1289,7 @@ namespace
                      kHiddenSize, stream);
     }
 
+    // Step 8. Scatter the reordered expert outputs back to the final token-major output buffer.
     optimized_scatter_add_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
                                        256,
                                    256, 0, stream>>>(
@@ -1239,6 +1300,9 @@ namespace
 
 } // namespace
 
+// Public entrypoint:
+// validate tensor contracts, run routing, pick the execution path, and cast the
+// accumulated FP32 output back to the required BF16 result tensor.
 ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView &routing_bias,
                    const ffi::TensorView &hidden_states,
                    const ffi::TensorView &hidden_states_scale,
