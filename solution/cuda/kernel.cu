@@ -203,6 +203,41 @@ namespace
     return (value + alignment - 1) / alignment * alignment;
   }
 
+  class WorkspaceArena
+  {
+  public:
+    WorkspaceArena(size_t bytes, cudaStream_t stream) : storage_(bytes, stream) {}
+
+    template <typename T>
+    T *Alloc(size_t count)
+    {
+      size_t aligned_offset = AlignUp(offset_bytes_, static_cast<size_t>(alignof(T)));
+      size_t bytes = sizeof(T) * count;
+      if (aligned_offset + bytes > storage_.size())
+      {
+        TVM_FFI_THROW(RuntimeError) << "WorkspaceArena overflow: requested " << bytes
+                                    << " bytes with " << (storage_.size() - offset_bytes_)
+                                    << " bytes remaining";
+      }
+      T *ptr = reinterpret_cast<T *>(storage_.get() + aligned_offset);
+      offset_bytes_ = aligned_offset + bytes;
+      return ptr;
+    }
+
+  private:
+    AsyncBuffer<uint8_t> storage_;
+    size_t offset_bytes_ = 0;
+  };
+
+  struct PreparedExpertWorkload
+  {
+    int32_t *expert_counts = nullptr;
+    int32_t *expert_offsets = nullptr;
+    int32_t *reordered_tokens = nullptr;
+    int32_t *reordered_local_experts = nullptr;
+    int32_t *total_rows = nullptr;
+  };
+
   __device__ inline float fp8_to_float(__nv_fp8_e4m3 value)
   {
     return static_cast<float>(value);
@@ -419,6 +454,31 @@ namespace
     dst[idx] = fp8_to_float(src[idx]) * scale[scale_idx];
   }
 
+  __global__ void dequant_selected_experts_to_f32_kernel(const int32_t *expert_ids,
+                                                         const __nv_fp8_e4m3 *src,
+                                                         const float *scale, float *dst,
+                                                         int32_t num_selected, int64_t n,
+                                                         int64_t k)
+  {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t expert_size = n * k;
+    if (idx >= static_cast<int64_t>(num_selected) * expert_size)
+    {
+      return;
+    }
+    int32_t selected_slot = static_cast<int32_t>(idx / expert_size);
+    int32_t local_expert = expert_ids[selected_slot];
+    int64_t offset = idx % expert_size;
+    int64_t row = offset / k;
+    int64_t col = offset % k;
+    int64_t n_blocks = n / kBlock;
+    int64_t k_blocks = k / kBlock;
+    int64_t scale_idx = static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
+                        (row / kBlock) * k_blocks + (col / kBlock);
+    dst[idx] = fp8_to_float(src[static_cast<int64_t>(local_expert) * expert_size + offset]) *
+               scale[scale_idx];
+  }
+
   __global__ void finalize_expert_offsets_kernel(const int32_t *expert_counts, int32_t *expert_offsets,
                                                  int32_t *total_reordered)
   {
@@ -429,6 +489,54 @@ namespace
     int32_t total = expert_offsets[kLocalExperts - 1] + expert_counts[kLocalExperts - 1];
     expert_offsets[kLocalExperts] = total;
     total_reordered[0] = total;
+  }
+
+  size_t GetExpertScanWorkspaceSize(cudaStream_t stream)
+  {
+    size_t scan_workspace_size = 0;
+    CHECK_CUDA(cub::DeviceScan::ExclusiveSum(nullptr, scan_workspace_size,
+                                             static_cast<int32_t *>(nullptr),
+                                             static_cast<int32_t *>(nullptr), kLocalExperts,
+                                             stream));
+    return scan_workspace_size;
+  }
+
+  PreparedExpertWorkload PrepareExpertWorkload(const int32_t *topk_idx, int64_t t,
+                                               int32_t local_expert_offset, int32_t max_rows,
+                                               size_t scan_workspace_size,
+                                               WorkspaceArena *workspace, cudaStream_t stream)
+  {
+    PreparedExpertWorkload prepared;
+    prepared.expert_counts = workspace->Alloc<int32_t>(kLocalExperts);
+    prepared.expert_offsets = workspace->Alloc<int32_t>(kLocalExperts + 1);
+    prepared.reordered_tokens = workspace->Alloc<int32_t>(max_rows);
+    prepared.reordered_local_experts = workspace->Alloc<int32_t>(max_rows);
+    int32_t *tmp_counts = workspace->Alloc<int32_t>(kLocalExperts);
+    prepared.total_rows = workspace->Alloc<int32_t>(1);
+    uint8_t *scan_workspace = workspace->Alloc<uint8_t>(scan_workspace_size);
+
+    CHECK_CUDA(cudaMemsetAsync(prepared.expert_counts, 0, kLocalExperts * sizeof(int32_t), stream));
+    CHECK_CUDA(cudaMemsetAsync(tmp_counts, 0, kLocalExperts * sizeof(int32_t), stream));
+
+    count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(
+        topk_idx, prepared.expert_counts, t, local_expert_offset);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cub::DeviceScan::ExclusiveSum(scan_workspace, scan_workspace_size,
+                                             prepared.expert_counts, prepared.expert_offsets,
+                                             kLocalExperts, stream));
+    finalize_expert_offsets_kernel<<<1, 1, 0, stream>>>(prepared.expert_counts,
+                                                        prepared.expert_offsets,
+                                                        prepared.total_rows);
+    CHECK_CUDA(cudaGetLastError());
+
+    reorder_tokens_kernel<<<t, 1, 0, stream>>>(topk_idx, prepared.expert_offsets, tmp_counts,
+                                               prepared.reordered_tokens,
+                                               prepared.reordered_local_experts, t,
+                                               local_expert_offset);
+    CHECK_CUDA(cudaGetLastError());
+
+    return prepared;
   }
 
   __global__ void fused_gather_dequant_f32_kernel(const __nv_fp8_e4m3 *src,
@@ -453,21 +561,7 @@ namespace
     dst[idx] = fp8_to_float(src[static_cast<int64_t>(token) * kHiddenSize + col]) * scale;
   }
 
-  __global__ void swiglu_f32_kernel(const float *g1, float *c, int64_t total_rows)
-  {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total_rows * kIntermediateSize)
-    {
-      return;
-    }
-    int64_t row = idx / kIntermediateSize;
-    int64_t col = idx % kIntermediateSize;
-    float x1 = g1[row * (2 * kIntermediateSize) + col];
-    float x2 = g1[row * (2 * kIntermediateSize) + kIntermediateSize + col];
-    c[idx] = x1 * (x2 / (1.0f + expf(-x2)));
-  }
-
-  __global__ void swiglu_f32_total_kernel(const float *g1, float *c, const int32_t *total_rows_ptr)
+  __global__ void swiglu_f32_kernel(const float *g1, float *c, const int32_t *total_rows_ptr)
   {
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int32_t total_rows = total_rows_ptr[0];
@@ -485,28 +579,8 @@ namespace
   __global__ void optimized_scatter_add_kernel(const float *o, const int32_t *token_idx,
                                                const int32_t *local_expert_idx,
                                                const float *weights, float *output,
-                                               int64_t total_reordered,
+                                               const int32_t *total_rows_ptr,
                                                int32_t local_expert_offset)
-  {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total_reordered * kHiddenSize)
-    {
-      return;
-    }
-    int64_t row = idx / kHiddenSize;
-    int32_t token = token_idx[row];
-    int32_t local_expert = local_expert_idx[row];
-    float weight =
-        weights[static_cast<int64_t>(token) * kGlobalExperts + local_expert + local_expert_offset];
-    atomicAdd(&output[static_cast<int64_t>(token) * kHiddenSize + (idx % kHiddenSize)],
-              o[idx] * weight);
-  }
-
-  __global__ void optimized_scatter_add_total_kernel(const float *o, const int32_t *token_idx,
-                                                     const int32_t *local_expert_idx,
-                                                     const float *weights, float *output,
-                                                     const int32_t *total_rows_ptr,
-                                                     int32_t local_expert_offset)
   {
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int32_t total_reordered = total_rows_ptr[0];
@@ -528,16 +602,14 @@ namespace
       const float *__restrict__ a, const int32_t *__restrict__ expert_offsets,
       const int32_t *__restrict__ expert_counts,
       const __nv_fp8_e4m3 *__restrict__ gemm1_weights,
-      const float *__restrict__ gemm1_weights_scale, float *__restrict__ g1,
-      int32_t row_threshold)
+      const float *__restrict__ gemm1_weights_scale, float *__restrict__ g1)
   {
     __shared__ float a_tile[TileM][TileK];
     __shared__ float b_tile[TileK][TileN + 1];
 
     int32_t local_expert = blockIdx.y;
     int32_t rows = expert_counts[local_expert];
-    bool use_this_kernel = row_threshold < 0 ? rows < -row_threshold : rows >= row_threshold;
-    if (!use_this_kernel || rows <= 0)
+    if (rows <= 0)
     {
       return;
     }
@@ -626,16 +698,14 @@ namespace
       const float *__restrict__ c, const int32_t *__restrict__ expert_offsets,
       const int32_t *__restrict__ expert_counts,
       const __nv_fp8_e4m3 *__restrict__ gemm2_weights,
-      const float *__restrict__ gemm2_weights_scale, float *__restrict__ o,
-      int32_t row_threshold)
+      const float *__restrict__ gemm2_weights_scale, float *__restrict__ o)
   {
     __shared__ float c_tile[TileM][TileK];
     __shared__ float b_tile[TileK][TileN + 1];
 
     int32_t local_expert = blockIdx.y;
     int32_t rows = expert_counts[local_expert];
-    bool use_this_kernel = row_threshold < 0 ? rows < -row_threshold : rows >= row_threshold;
-    if (!use_this_kernel || rows <= 0)
+    if (rows <= 0)
     {
       return;
     }
@@ -781,13 +851,12 @@ namespace
                              const int32_t *expert_counts,
                              const __nv_fp8_e4m3 *gemm1_weights,
                              const float *gemm1_weights_scale, float *g1_f32,
-                             int32_t row_threshold, cudaStream_t stream)
+                             cudaStream_t stream)
   {
     dim3 block(TileN, TileM);
     dim3 grid((2 * kIntermediateSize + TileN - 1) / TileN, kLocalExperts);
     gemm1_grouped_variable_fp8_kernel<TileM, TileN, TileK><<<grid, block, 0, stream>>>(
-        a_f32, expert_offsets, expert_counts, gemm1_weights, gemm1_weights_scale, g1_f32,
-        row_threshold);
+        a_f32, expert_offsets, expert_counts, gemm1_weights, gemm1_weights_scale, g1_f32);
     CHECK_CUDA(cudaGetLastError());
   }
 
@@ -796,13 +865,12 @@ namespace
                              const int32_t *expert_counts,
                              const __nv_fp8_e4m3 *gemm2_weights,
                              const float *gemm2_weights_scale, float *o_f32,
-                             int32_t row_threshold, cudaStream_t stream)
+                             cudaStream_t stream)
   {
     dim3 block(TileN, TileM);
     dim3 grid((kHiddenSize + TileN - 1) / TileN, kLocalExperts);
     gemm2_grouped_variable_fp8_kernel<TileM, TileN, TileK><<<grid, block, 0, stream>>>(
-        c_f32, expert_offsets, expert_counts, gemm2_weights, gemm2_weights_scale, o_f32,
-        row_threshold);
+        c_f32, expert_offsets, expert_counts, gemm2_weights, gemm2_weights_scale, o_f32);
     CHECK_CUDA(cudaGetLastError());
   }
 
@@ -817,75 +885,50 @@ namespace
   {
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
-
-    AsyncBuffer<int32_t> d_expert_counts(kLocalExperts, stream);
-    AsyncBuffer<int32_t> d_expert_offsets(kLocalExperts + 1, stream);
-    AsyncBuffer<int32_t> d_reordered_tokens(max_rows, stream);
-    AsyncBuffer<int32_t> d_reordered_local_experts(max_rows, stream);
-    AsyncBuffer<int32_t> d_tmp_counts(kLocalExperts, stream);
-    AsyncBuffer<int32_t> d_total_rows(1, stream);
-    CHECK_CUDA(cudaMemsetAsync(d_expert_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(d_tmp_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(d_reordered_tokens.get(), 0xFF, max_rows * sizeof(int32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(d_reordered_local_experts.get(), 0xFF,
-                               max_rows * sizeof(int32_t), stream));
-
-    count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(
-        topk_idx, d_expert_counts.get(), t, local_expert_offset);
-    CHECK_CUDA(cudaGetLastError());
-
-    size_t scan_workspace_size = 0;
-    CHECK_CUDA(cub::DeviceScan::ExclusiveSum(nullptr, scan_workspace_size, d_expert_counts.get(),
-                                             d_expert_offsets.get(), kLocalExperts, stream));
-    AsyncBuffer<uint8_t> scan_workspace(scan_workspace_size, stream);
-    CHECK_CUDA(cub::DeviceScan::ExclusiveSum(scan_workspace.get(), scan_workspace_size,
-                                             d_expert_counts.get(), d_expert_offsets.get(),
-                                             kLocalExperts, stream));
-    finalize_expert_offsets_kernel<<<1, 1, 0, stream>>>(d_expert_counts.get(),
-                                                        d_expert_offsets.get(),
-                                                        d_total_rows.get());
-    CHECK_CUDA(cudaGetLastError());
-
-    reorder_tokens_kernel<<<t, 1, 0, stream>>>(topk_idx, d_expert_offsets.get(), d_tmp_counts.get(),
-                                               d_reordered_tokens.get(),
-                                               d_reordered_local_experts.get(), t,
-                                               local_expert_offset);
-    CHECK_CUDA(cudaGetLastError());
-
-    AsyncBuffer<float> a_f32(static_cast<size_t>(max_rows) * kHiddenSize, stream);
-    AsyncBuffer<float> g1_f32(static_cast<size_t>(max_rows) * 2 * kIntermediateSize, stream);
-    AsyncBuffer<float> c_f32(static_cast<size_t>(max_rows) * kIntermediateSize, stream);
-    AsyncBuffer<float> o_f32(static_cast<size_t>(max_rows) * kHiddenSize, stream);
+    size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
+    size_t workspace_bytes = sizeof(int32_t) *
+                                 static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 +
+                                                     2 * max_rows) +
+                             scan_workspace_size +
+                             sizeof(float) * static_cast<size_t>(max_rows) *
+                                 (2 * kHiddenSize + 3 * kIntermediateSize);
+    WorkspaceArena workspace(workspace_bytes, stream);
+    PreparedExpertWorkload prepared =
+        PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
+                              &workspace, stream);
+    float *a_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
+    float *g1_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * 2 * kIntermediateSize);
+    float *c_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kIntermediateSize);
+    float *o_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
 
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                       256, 0, stream>>>(
-        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), d_reordered_tokens.get(),
-        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32.get(), max_rows, scale_t);
+        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
+        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, max_rows, scale_t);
     CHECK_CUDA(cudaGetLastError());
 
     LaunchGroupedFp8Gemm1<kGemm1TileM, kGemm1TileN, kGemm1TileK>(
-        a_f32.get(), d_expert_offsets.get(), d_expert_counts.get(),
+        a_f32, prepared.expert_offsets, prepared.expert_counts,
         static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
-        static_cast<const float *>(gemm1_weights_scale.data_ptr()), g1_f32.get(), 0, stream);
+        static_cast<const float *>(gemm1_weights_scale.data_ptr()), g1_f32, stream);
 
-    swiglu_f32_total_kernel<<<(static_cast<int64_t>(max_rows) * kIntermediateSize + 255) / 256,
-                              256, 0, stream>>>(g1_f32.get(), c_f32.get(), d_total_rows.get());
+    swiglu_f32_kernel<<<(static_cast<int64_t>(max_rows) * kIntermediateSize + 255) / 256,
+                        256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
 
     LaunchGroupedFp8Gemm2<kGemm2TileM, kGemm2TileN, kGemm2TileK>(
-        c_f32.get(), d_expert_offsets.get(), d_expert_counts.get(),
+        c_f32, prepared.expert_offsets, prepared.expert_counts,
         static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
-        static_cast<const float *>(gemm2_weights_scale.data_ptr()), o_f32.get(), 0, stream);
+        static_cast<const float *>(gemm2_weights_scale.data_ptr()), o_f32, stream);
 
-    optimized_scatter_add_total_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) /
-                                             256,
-                                         256, 0, stream>>>(
-        o_f32.get(), d_reordered_tokens.get(), d_reordered_local_experts.get(), weights,
-        output_fp32, d_total_rows.get(), local_expert_offset);
+    optimized_scatter_add_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
+                                   256, 0, stream>>>(
+        o_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights, output_fp32,
+        prepared.total_rows, local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
   }
 
-  [[maybe_unused]] void RunGroupedWorkloadPipeline(
+  void RunGroupedWorkloadPipeline(
       const ffi::TensorView &hidden_states, const ffi::TensorView &hidden_states_scale,
       const ffi::TensorView &gemm1_weights, const ffi::TensorView &gemm1_weights_scale,
       const ffi::TensorView &gemm2_weights, const ffi::TensorView &gemm2_weights_scale,
@@ -893,29 +936,25 @@ namespace
       int32_t local_expert_offset, cudaStream_t stream)
   {
     int64_t scale_t = hidden_states_scale.size(1);
-    AsyncBuffer<int32_t> d_expert_counts(kLocalExperts, stream);
-    AsyncBuffer<int32_t> d_expert_offsets(kLocalExperts + 1, stream);
-    AsyncBuffer<int32_t> d_reordered_tokens(t * kTopK, stream);
-    AsyncBuffer<int32_t> d_reordered_local_experts(t * kTopK, stream);
-    AsyncBuffer<int32_t> d_tmp_counts(kLocalExperts, stream);
-    CHECK_CUDA(cudaMemsetAsync(d_expert_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
-    CHECK_CUDA(cudaMemsetAsync(d_tmp_counts.get(), 0, kLocalExperts * sizeof(int32_t), stream));
-
-    count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(
-        topk_idx, d_expert_counts.get(), t, local_expert_offset);
-    CHECK_CUDA(cudaGetLastError());
+    int32_t max_rows = static_cast<int32_t>(t * kTopK);
+    size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
+    size_t prep_workspace_bytes = sizeof(int32_t) *
+                                      static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 +
+                                                          2 * max_rows) +
+                                  scan_workspace_size;
+    WorkspaceArena prep_workspace(prep_workspace_bytes, stream);
+    PreparedExpertWorkload prepared =
+        PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
+                              &prep_workspace, stream);
 
     std::vector<int32_t> h_counts(kLocalExperts);
     std::vector<int32_t> h_offsets(kLocalExperts + 1);
-    CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), d_expert_counts.get(),
+    CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), prepared.expert_counts,
                                kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDA(cudaMemcpyAsync(h_offsets.data(), prepared.expert_offsets,
+                               (kLocalExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                               stream));
     CHECK_CUDA(cudaStreamSynchronize(stream));
-
-    h_offsets[0] = 0;
-    for (int i = 0; i < kLocalExperts; ++i)
-    {
-      h_offsets[i + 1] = h_offsets[i] + h_counts[i];
-    }
     int32_t total_reordered = h_offsets[kLocalExperts];
     std::vector<int32_t> grouped_gemm1_experts;
     std::vector<int32_t> grouped_gemm2_experts;
@@ -934,76 +973,80 @@ namespace
         grouped_gemm2_experts.push_back(i);
       }
     }
-    CHECK_CUDA(cudaMemcpyAsync(d_expert_offsets.get(), h_offsets.data(),
-                               (kLocalExperts + 1) * sizeof(int32_t), cudaMemcpyHostToDevice,
-                               stream));
-
-    reorder_tokens_kernel<<<t, 1, 0, stream>>>(topk_idx, d_expert_offsets.get(), d_tmp_counts.get(),
-                                               d_reordered_tokens.get(),
-                                               d_reordered_local_experts.get(), t,
-                                               local_expert_offset);
-    CHECK_CUDA(cudaGetLastError());
 
     if (total_reordered == 0)
     {
       return;
     }
 
-    AsyncBuffer<float> g1_f32(static_cast<size_t>(total_reordered) * 2 * kIntermediateSize, stream);
-    AsyncBuffer<float> c_f32(static_cast<size_t>(total_reordered) * kIntermediateSize, stream);
-    AsyncBuffer<float> a_f32(static_cast<size_t>(total_reordered) * kHiddenSize, stream);
-    AsyncBuffer<float> w13_grouped_f32(static_cast<size_t>(grouped_gemm1_experts.size()) *
-                                           2 * kIntermediateSize * kHiddenSize,
-                                       stream);
-    AsyncBuffer<float> w2_grouped_f32(static_cast<size_t>(grouped_gemm2_experts.size()) *
-                                          kHiddenSize * kIntermediateSize,
-                                      stream);
-    AsyncBuffer<float> w13_small_tmp(2 * kIntermediateSize * kHiddenSize, stream);
-    AsyncBuffer<float> w2_small_tmp(kHiddenSize * kIntermediateSize, stream);
-    AsyncBuffer<float> o_grouped_f32(static_cast<size_t>(total_reordered) * kHiddenSize, stream);
+    size_t compute_workspace_bytes =
+        sizeof(float) * static_cast<size_t>(total_reordered) *
+            (2 * kIntermediateSize + kIntermediateSize + kHiddenSize + kHiddenSize) +
+        sizeof(float) * static_cast<size_t>(grouped_gemm1_experts.size()) *
+            2 * kIntermediateSize * kHiddenSize +
+        sizeof(float) * static_cast<size_t>(grouped_gemm2_experts.size()) *
+            kHiddenSize * kIntermediateSize +
+        sizeof(float) * (2 * kIntermediateSize * kHiddenSize + kHiddenSize * kIntermediateSize) +
+        sizeof(int32_t) * (grouped_gemm1_experts.size() + grouped_gemm2_experts.size());
+    WorkspaceArena compute_workspace(compute_workspace_bytes, stream);
+    float *g1_f32 = compute_workspace.Alloc<float>(
+        static_cast<size_t>(total_reordered) * 2 * kIntermediateSize);
+    float *c_f32 =
+        compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kIntermediateSize);
+    float *a_f32 =
+        compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kHiddenSize);
+    float *w13_grouped_f32 = compute_workspace.Alloc<float>(
+        static_cast<size_t>(grouped_gemm1_experts.size()) * 2 * kIntermediateSize * kHiddenSize);
+    float *w2_grouped_f32 = compute_workspace.Alloc<float>(
+        static_cast<size_t>(grouped_gemm2_experts.size()) * kHiddenSize * kIntermediateSize);
+    float *w13_small_tmp = compute_workspace.Alloc<float>(2 * kIntermediateSize * kHiddenSize);
+    float *w2_small_tmp = compute_workspace.Alloc<float>(kHiddenSize * kIntermediateSize);
+    float *o_grouped_f32 =
+        compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kHiddenSize);
+    int32_t *d_grouped_gemm1_experts =
+        compute_workspace.Alloc<int32_t>(grouped_gemm1_experts.size());
+    int32_t *d_grouped_gemm2_experts =
+        compute_workspace.Alloc<int32_t>(grouped_gemm2_experts.size());
 
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
                                           256,
                                       256, 0, stream>>>(
-        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), d_reordered_tokens.get(),
-        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32.get(), total_reordered,
+        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
+        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, total_reordered,
         scale_t);
     CHECK_CUDA(cudaGetLastError());
-    for (int32_t grouped_idx = 0; grouped_idx < static_cast<int32_t>(grouped_gemm1_experts.size());
-         ++grouped_idx)
+    if (!grouped_gemm1_experts.empty())
     {
-      int32_t local_expert = grouped_gemm1_experts[static_cast<size_t>(grouped_idx)];
-      dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize +
-                                       255) /
-                                          256,
-                                      256, 0, stream>>>(
-          static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()) +
-              static_cast<int64_t>(local_expert) * 2 * kIntermediateSize * kHiddenSize,
-          static_cast<const float *>(gemm1_weights_scale.data_ptr()) +
-              static_cast<int64_t>(local_expert) * ((2 * kIntermediateSize) / kBlock) *
-                  (kHiddenSize / kBlock),
-          w13_grouped_f32.get() +
-              static_cast<int64_t>(grouped_idx) * 2 * kIntermediateSize * kHiddenSize,
-          1, 2 * kIntermediateSize, kHiddenSize);
+      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm1_experts, grouped_gemm1_experts.data(),
+                                 grouped_gemm1_experts.size() * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice, stream));
+      dequant_selected_experts_to_f32_kernel<<<
+          (static_cast<int64_t>(grouped_gemm1_experts.size()) * 2 * kIntermediateSize *
+               kHiddenSize +
+           255) /
+              256,
+          256, 0, stream>>>(d_grouped_gemm1_experts,
+                             static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
+                             static_cast<const float *>(gemm1_weights_scale.data_ptr()),
+                             w13_grouped_f32, static_cast<int32_t>(grouped_gemm1_experts.size()),
+                             2 * kIntermediateSize, kHiddenSize);
       CHECK_CUDA(cudaGetLastError());
     }
 
-    for (int32_t grouped_idx = 0; grouped_idx < static_cast<int32_t>(grouped_gemm2_experts.size());
-         ++grouped_idx)
+    if (!grouped_gemm2_experts.empty())
     {
-      int32_t local_expert = grouped_gemm2_experts[static_cast<size_t>(grouped_idx)];
-      dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(kHiddenSize) * kIntermediateSize +
-                                       255) /
-                                          256,
-                                      256, 0, stream>>>(
-          static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()) +
-              static_cast<int64_t>(local_expert) * kHiddenSize * kIntermediateSize,
-          static_cast<const float *>(gemm2_weights_scale.data_ptr()) +
-              static_cast<int64_t>(local_expert) * (kHiddenSize / kBlock) *
-                  (kIntermediateSize / kBlock),
-          w2_grouped_f32.get() + static_cast<int64_t>(grouped_idx) * kHiddenSize * kIntermediateSize,
-          1,
-          kHiddenSize, kIntermediateSize);
+      CHECK_CUDA(cudaMemcpyAsync(d_grouped_gemm2_experts, grouped_gemm2_experts.data(),
+                                 grouped_gemm2_experts.size() * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice, stream));
+      dequant_selected_experts_to_f32_kernel<<<
+          (static_cast<int64_t>(grouped_gemm2_experts.size()) * kHiddenSize * kIntermediateSize +
+           255) /
+              256,
+          256, 0, stream>>>(d_grouped_gemm2_experts,
+                             static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
+                             static_cast<const float *>(gemm2_weights_scale.data_ptr()),
+                             w2_grouped_f32, static_cast<int32_t>(grouped_gemm2_experts.size()),
+                             kHiddenSize, kIntermediateSize);
       CHECK_CUDA(cudaGetLastError());
     }
 
@@ -1030,11 +1073,10 @@ namespace
             static_cast<const float *>(gemm1_weights_scale.data_ptr()) +
                 static_cast<int64_t>(i) * ((2 * kIntermediateSize) / kBlock) *
                     (kHiddenSize / kBlock),
-            w13_small_tmp.get(), 1, 2 * kIntermediateSize, kHiddenSize);
+            w13_small_tmp, 1, 2 * kIntermediateSize, kHiddenSize);
         CHECK_CUDA(cudaGetLastError());
-        RunGemmF32(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
-                   w13_small_tmp.get(),
-                   g1_f32.get() + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
+        RunGemmF32(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize, w13_small_tmp,
+                   g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
                    h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
       }
       else
@@ -1042,12 +1084,12 @@ namespace
         int32_t grouped_idx = grouped_gemm1_slots[i];
         prob1.push_back({h_counts[i], static_cast<int>(2 * kIntermediateSize),
                          static_cast<int>(kHiddenSize)});
-        ptr_a1.push_back(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
-        ptr_b1.push_back(w13_grouped_f32.get() +
+        ptr_a1.push_back(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
+        ptr_b1.push_back(w13_grouped_f32 +
                          static_cast<int64_t>(grouped_idx) * 2 * kIntermediateSize * kHiddenSize);
-        ptr_c1.push_back(g1_f32.get() + static_cast<int64_t>(h_offsets[i]) *
+        ptr_c1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) *
                                             2 * kIntermediateSize);
-        ptr_d1.push_back(g1_f32.get() + static_cast<int64_t>(h_offsets[i]) *
+        ptr_d1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) *
                                             2 * kIntermediateSize);
       }
     }
@@ -1080,7 +1122,7 @@ namespace
     }
 
     swiglu_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kIntermediateSize + 255) / 256,
-                        256, 0, stream>>>(g1_f32.get(), c_f32.get(), total_reordered);
+                        256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
 
     std::vector<cutlass::gemm::GemmCoord> prob2;
@@ -1103,11 +1145,10 @@ namespace
                 static_cast<int64_t>(i) * kHiddenSize * kIntermediateSize,
             static_cast<const float *>(gemm2_weights_scale.data_ptr()) +
                 static_cast<int64_t>(i) * (kHiddenSize / kBlock) * (kIntermediateSize / kBlock),
-            w2_small_tmp.get(), 1, kHiddenSize, kIntermediateSize);
+            w2_small_tmp, 1, kHiddenSize, kIntermediateSize);
         CHECK_CUDA(cudaGetLastError());
-        RunGemmF32(c_f32.get() + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize,
-                   w2_small_tmp.get(),
-                   o_grouped_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
+        RunGemmF32(c_f32 + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize, w2_small_tmp,
+                   o_grouped_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
                    h_counts[i], kHiddenSize, kIntermediateSize, stream);
       }
       else
@@ -1115,10 +1156,10 @@ namespace
         int32_t grouped_idx = grouped_gemm2_slots[i];
         prob2.push_back(
             {h_counts[i], static_cast<int>(kHiddenSize), static_cast<int>(kIntermediateSize)});
-        ptr_a2.push_back(c_f32.get() + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize);
-        ptr_b2.push_back(w2_grouped_f32.get() +
+        ptr_a2.push_back(c_f32 + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize);
+        ptr_b2.push_back(w2_grouped_f32 +
                          static_cast<int64_t>(grouped_idx) * kHiddenSize * kIntermediateSize);
-        ptr_d2.push_back(o_grouped_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
+        ptr_d2.push_back(o_grouped_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
       }
     }
 
@@ -1148,8 +1189,8 @@ namespace
     optimized_scatter_add_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
                                        256,
                                    256, 0, stream>>>(
-        o_grouped_f32.get(), d_reordered_tokens.get(), d_reordered_local_experts.get(), weights,
-        output_fp32, total_reordered, local_expert_offset);
+        o_grouped_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights,
+        output_fp32, prepared.total_rows, local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
   }
 
