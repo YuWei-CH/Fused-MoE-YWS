@@ -49,7 +49,13 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={TRACE_SET_PATH: trace_volume},
+    max_containers=10,
+)
 def run_benchmark(
     solution: Solution,
     config: BenchmarkConfig = None,
@@ -199,13 +205,49 @@ def main(
             enabled.append("timing")
         print(f"Kernel debug enabled: {', '.join(enabled)}")
         print("Using reduced benchmark config for diagnostics: warmup=0, iterations=1, trials=1")
-    results = run_benchmark.remote(
-        solution,
-        max_workloads=max_workloads,
-        workload_uuid=workload_uuid,
-        debug_histogram=debug_histogram,
-        debug_timing=debug_timing,
+    workload_uuids: list[str]
+    if workload_uuid:
+        workload_uuids = [workload_uuid]
+    else:
+        workload_file = (
+            PROJECT_ROOT.parent
+            / "mlsys26-contest"
+            / "workloads"
+            / "moe"
+            / f"{solution.definition}.jsonl"
+        )
+        if not workload_file.exists():
+            raise FileNotFoundError(
+                f"Workload manifest not found: {workload_file}"
+            )
+        workload_uuids = []
+        with workload_file.open() as f:
+            for line in f:
+                data = json.loads(line)
+                workload_uuids.append(data["workload"]["uuid"])
+
+    if max_workloads > 0:
+        workload_uuids = workload_uuids[:max_workloads]
+
+    print(
+        f"Dispatching {len(workload_uuids)} workload(s) across up to 10 concurrent B200 containers..."
     )
+
+    results = {}
+    for res in run_benchmark.map(
+        [solution] * len(workload_uuids),
+        [None] * len(workload_uuids),
+        [0] * len(workload_uuids),
+        workload_uuids,
+        [debug_histogram] * len(workload_uuids),
+        [debug_timing] * len(workload_uuids),
+    ):
+        if not res:
+            continue
+        for def_name, traces in res.items():
+            if def_name not in results:
+                results[def_name] = {}
+            results[def_name].update(traces)
 
     if not results:
         print("No results returned!")
