@@ -19,10 +19,20 @@ SOURCE_PATHS = tuple(
     if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
 )
 
-# hash-based JIT extension loading (For test now)
+
+def _cuda_cflags() -> list[str]:
+    return [
+        "-O3",
+        "--use_fast_math",
+        "-std=c++21",
+        "-lineinfo",
+        # "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_100,code=sm_100",
+    ]
+
+# Hash-based JIT extension loading.
 @lru_cache(maxsize=1)
 def _load_extension():
-    ### Read .cu file, compute hash, and create module
     hasher = hashlib.sha1()
     for path in SOURCE_PATHS:
         hasher.update(str(path.relative_to(THIS_DIR)).encode())
@@ -31,13 +41,12 @@ def _load_extension():
     module_name = f"flashinfer_moe_cuda_{source_hash}"
     return load(
         name=module_name,
-        sources=[str(KERNEL_PATH)], ### Load the .cu file as a source
-        extra_cuda_cflags=["-O0"], ### NO optimization, TODO: ["-O3", "--use_fast_math"]
+        sources=[str(KERNEL_PATH)],
+        extra_cuda_cflags=_cuda_cflags(),
         verbose=False,
     )
 
 
-# Registers this Python function into a global function registry
 @register_func("flashinfer.kernel")
 def kernel(
     routing_logits: torch.Tensor,
