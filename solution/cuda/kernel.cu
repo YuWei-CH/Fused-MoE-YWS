@@ -206,6 +206,44 @@ namespace
   };
 
   template <typename T>
+  class PinnedHostBuffer
+  {
+  public:
+    PinnedHostBuffer() = default;
+
+    explicit PinnedHostBuffer(size_t count) : count_(count)
+    {
+      if (count_ == 0)
+      {
+        return;
+      }
+      CHECK_CUDA(cudaMallocHost(reinterpret_cast<void **>(&ptr_), sizeof(T) * count_));
+    }
+
+    ~PinnedHostBuffer()
+    {
+      if (ptr_ != nullptr)
+      {
+        cudaError_t err = cudaFreeHost(ptr_);
+        (void)err;
+      }
+    }
+
+    PinnedHostBuffer(const PinnedHostBuffer &) = delete;
+    PinnedHostBuffer &operator=(const PinnedHostBuffer &) = delete;
+
+    T *get() const { return ptr_; }
+    size_t size() const { return count_; }
+
+    T &operator[](size_t idx) { return ptr_[idx]; }
+    const T &operator[](size_t idx) const { return ptr_[idx]; }
+
+  private:
+    T *ptr_ = nullptr;
+    size_t count_ = 0;
+  };
+
+  template <typename T>
   constexpr T AlignUp(T value, T alignment)
   {
     return (value + alignment - 1) / alignment * alignment;
@@ -523,6 +561,16 @@ namespace
     return plan;
   }
 
+  std::vector<int32_t> BuildExpertOffsetsFromCounts(const std::vector<int32_t> &expert_counts)
+  {
+    std::vector<int32_t> expert_offsets(kLocalExperts + 1, 0);
+    for (int32_t expert = 0; expert < kLocalExperts; ++expert)
+    {
+      expert_offsets[expert + 1] = expert_offsets[expert] + expert_counts[expert];
+    }
+    return expert_offsets;
+  }
+
   // ---------------------------------------------------------------------------
   // Stage 2: build the local expert workload.
   // Convert token-level routing outputs into an expert-major row layout that both
@@ -549,6 +597,8 @@ namespace
 
     CHECK_CUDA(cudaMemsetAsync(prepared.expert_counts, 0, kLocalExperts * sizeof(int32_t), stream));
     CHECK_CUDA(cudaMemsetAsync(tmp_counts, 0, kLocalExperts * sizeof(int32_t), stream));
+    CHECK_CUDA(cudaMemsetAsync(prepared.reordered_tokens, 0xFF,
+                               max_rows * sizeof(int32_t), stream));
 
     count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(
         topk_idx, prepared.expert_counts, t, local_expert_offset);
@@ -921,9 +971,12 @@ namespace
                       cudaStream_t stream)
   {
     // CUTLASS grouped GEMM for the large-expert subset in the grouped_workload path.
+    if (expert_count == 0)
+    {
+      return;
+    }
     using GemmGrouped = cutlass_grouped_f32::GemmGrouped;
     using LongIndex = typename GemmGrouped::LayoutA::Stride::LongIndex;
-
     std::vector<LongIndex> lda(expert_count, k);
     std::vector<LongIndex> ldb(expert_count, k);
     std::vector<LongIndex> ldc(expert_count, n);
@@ -940,7 +993,6 @@ namespace
                                cudaMemcpyHostToDevice, stream));
     CHECK_CUDA(cudaMemcpyAsync(d_ldd.get(), ldd.data(), expert_count * sizeof(LongIndex),
                                cudaMemcpyHostToDevice, stream));
-
     typename GemmGrouped::Arguments args(
         d_problem_sizes, expert_count, 1024, {1.0f, 0.0f}, ptr_a, ptr_b, ptr_c, ptr_d,
         d_lda.get(), d_ldb.get(), d_ldc.get(), d_ldd.get(), h_problem_sizes);
@@ -1061,15 +1113,39 @@ namespace
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &prep_workspace, stream);
 
-    // Step 2. Bring back expert row counts so the host can build grouped GEMM descriptors.
+    // Step 2. Copy only the per-expert row counts to pinned host memory on a side stream.
+    // The grouped CUTLASS path still needs host-built descriptor arrays, but we no longer
+    // copy expert_offsets back or stall the main stream before gathering activations.
+    cudaEvent_t workload_ready_event = nullptr;
+    cudaStream_t host_copy_stream = nullptr;
+    CHECK_CUDA(cudaEventCreateWithFlags(&workload_ready_event, cudaEventDisableTiming));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&host_copy_stream, cudaStreamNonBlocking));
+    PinnedHostBuffer<int32_t> h_counts_pinned(kLocalExperts);
+    CHECK_CUDA(cudaEventRecord(workload_ready_event, stream));
+    CHECK_CUDA(cudaStreamWaitEvent(host_copy_stream, workload_ready_event, 0));
+    CHECK_CUDA(cudaMemcpyAsync(h_counts_pinned.get(), prepared.expert_counts,
+                               kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                               host_copy_stream));
+
+    // Step 3. Start gathering activations immediately while the host-side counts transfer runs.
+    AsyncBuffer<float> a_f32(static_cast<size_t>(max_rows) * kHiddenSize, stream);
+    fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
+                                      256, 0, stream>>>(
+        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
+        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32.get(), max_rows,
+        scale_t);
+    CHECK_CUDA(cudaGetLastError());
+
+    CHECK_CUDA(cudaStreamSynchronize(host_copy_stream));
+    CHECK_CUDA(cudaEventDestroy(workload_ready_event));
+    CHECK_CUDA(cudaStreamDestroy(host_copy_stream));
+
     std::vector<int32_t> h_counts(kLocalExperts);
-    std::vector<int32_t> h_offsets(kLocalExperts + 1);
-    CHECK_CUDA(cudaMemcpyAsync(h_counts.data(), prepared.expert_counts,
-                               kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
-    CHECK_CUDA(cudaMemcpyAsync(h_offsets.data(), prepared.expert_offsets,
-                               (kLocalExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost,
-                               stream));
-    CHECK_CUDA(cudaStreamSynchronize(stream));
+    for (int32_t expert = 0; expert < kLocalExperts; ++expert)
+    {
+      h_counts[expert] = h_counts_pinned[expert];
+    }
+    std::vector<int32_t> h_offsets = BuildExpertOffsetsFromCounts(h_counts);
     int32_t total_reordered = h_offsets[kLocalExperts];
     GroupedExpertPlan grouped_gemm1 = BuildGroupedExpertPlan(h_counts, kGroupedGemm1Threshold);
     GroupedExpertPlan grouped_gemm2 = BuildGroupedExpertPlan(h_counts, kGroupedGemm2Threshold);
@@ -1086,8 +1162,6 @@ namespace
         static_cast<size_t>(total_reordered) * 2 * kIntermediateSize);
     float *c_f32 =
         compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kIntermediateSize);
-    float *a_f32 =
-        compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kHiddenSize);
     float *w13_grouped_f32 = compute_workspace.Alloc<float>(
         static_cast<size_t>(grouped_gemm1.experts.size()) * 2 * kIntermediateSize * kHiddenSize);
     float *w2_grouped_f32 = compute_workspace.Alloc<float>(
@@ -1100,15 +1174,6 @@ namespace
         compute_workspace.Alloc<int32_t>(grouped_gemm1.experts.size());
     int32_t *d_grouped_gemm2_experts =
         compute_workspace.Alloc<int32_t>(grouped_gemm2.experts.size());
-
-    // Step 3. Gather and dequantize all routed activation rows once.
-    fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
-                                          256,
-                                      256, 0, stream>>>(
-        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
-        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, total_reordered,
-        scale_t);
-    CHECK_CUDA(cudaGetLastError());
     if (!grouped_gemm1.experts.empty())
     {
       // Step 4a. Materialize GEMM1 weights for the large-expert subset.
@@ -1174,23 +1239,20 @@ namespace
                     (kHiddenSize / kBlock),
             w13_small_tmp, 1, 2 * kIntermediateSize, kHiddenSize);
         CHECK_CUDA(cudaGetLastError());
-        RunGemmF32(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize, w13_small_tmp,
+        RunGemmF32(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize, w13_small_tmp,
                    g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
                    h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
       }
       else
       {
-        // Large expert: enqueue it into the grouped GEMM descriptor arrays.
         int32_t grouped_idx = grouped_gemm1.slots[i];
         prob1.push_back({h_counts[i], static_cast<int>(2 * kIntermediateSize),
                          static_cast<int>(kHiddenSize)});
-        ptr_a1.push_back(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
+        ptr_a1.push_back(a_f32.get() + static_cast<int64_t>(h_offsets[i]) * kHiddenSize);
         ptr_b1.push_back(w13_grouped_f32 +
                          static_cast<int64_t>(grouped_idx) * 2 * kIntermediateSize * kHiddenSize);
-        ptr_c1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) *
-                                            2 * kIntermediateSize);
-        ptr_d1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) *
-                                            2 * kIntermediateSize);
+        ptr_c1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize);
+        ptr_d1.push_back(g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize);
       }
     }
 
