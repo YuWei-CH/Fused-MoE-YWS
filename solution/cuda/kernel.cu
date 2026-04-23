@@ -142,6 +142,7 @@ namespace
     }
   }
 
+  // Wrapper Class for cudaMallocAsync, cudaFreeAsync
   template <typename T>
   class AsyncBuffer
   {
@@ -205,6 +206,7 @@ namespace
     cudaStream_t stream_ = nullptr;
   };
 
+  // Efficient async D2H/H2D copy.
   template <typename T>
   class PinnedHostBuffer
   {
@@ -243,6 +245,7 @@ namespace
     size_t count_ = 0;
   };
 
+  // Up scale, round up
   template <typename T>
   constexpr T AlignUp(T value, T alignment)
   {
@@ -309,15 +312,14 @@ namespace
   // ---------------------------------------------------------------------------
 
   // Compute s = sigmoid(logits) and s_with_bias = s + bias.
-  __global__ void sigmoid_bias_kernel(const float *routing_logits, const __nv_bfloat16 *routing_bias,
-                                      float *s, float *s_with_bias, int64_t t)
+  __global__ void sigmoid_bias_kernel(const float *routing_logits,
+                                      const __nv_bfloat16 *routing_bias, float *s,
+                                      float *s_with_bias, int64_t t)
   {
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     int64_t total = t * kGlobalExperts;
     if (idx >= total)
-    {
       return;
-    }
     int64_t expert = idx % kGlobalExperts;
     float logit = routing_logits[idx];
     float sigmoid = 1.0f / (1.0f + expf(-logit));
@@ -327,10 +329,14 @@ namespace
 
   // One CUDA block per token. This mirrors the reference routing:
   // top-2 per group -> top-4 groups -> final top-8 experts -> normalized weights from s.
+  // routing_logits is FP32
+  // Output: topk_idx [t, 8], weights [t, kGlobalExperts]. 8 expert for the token and their weights.
+  // TODO: One block process more tokens
   __global__ void routing_select_kernel(const float *s, const float *s_with_bias, int32_t *topk_idx,
-                                        float *weights, int64_t t, float routed_scaling_factor)
+                                        float *weights, int64_t t,
+                                        float routed_scaling_factor)
   {
-    int64_t token = blockIdx.x;
+    int64_t token = blockIdx.x; // Actually just one thread work.
     if (token >= t || threadIdx.x != 0)
     {
       return;
@@ -441,7 +447,7 @@ namespace
     }
   }
 
-  // Final cast back to the contest output dtype.
+  // Final cast back to the contest output dtype. FP32 -> BF16
   __global__ void cast_output_kernel(const float *output_fp32, __nv_bfloat16 *output_bf16,
                                      int64_t total)
   {
@@ -469,6 +475,12 @@ namespace
       atomicAdd(&expert_counts[local_expert], 1);
     }
   }
+
+  // Reorder token-to-expert assignments into expert-major contiguous rows.
+  // row 0 -> (token 0, expert 1)
+  // row 1 -> (token 1, expert 1)
+  // row 2 -> (token 2, expert 2)
+  // row 3 -> (token 3, expert 2)
 
   __global__ void reorder_tokens_kernel(const int32_t *topk_idx, const int32_t *expert_offsets,
                                         int32_t *expert_current_counts, int32_t *reordered_tokens,
@@ -580,7 +592,7 @@ namespace
   // Build the expert-local workload layout shared by both execution paths:
   // 1) count local assignments
   // 2) exclusive-scan counts into per-expert row offsets
-  // 3) reorder (token, expert) pairs into one contiguous row-major expert layout
+  // 3) reorder (token, expert) pairs into one contiguous expert-major row layout
   PreparedExpertWorkload PrepareExpertWorkload(const int32_t *topk_idx, int64_t t,
                                                int32_t local_expert_offset, int32_t max_rows,
                                                size_t scan_workspace_size,
@@ -598,6 +610,8 @@ namespace
     CHECK_CUDA(cudaMemsetAsync(prepared.expert_counts, 0, kLocalExperts * sizeof(int32_t), stream));
     CHECK_CUDA(cudaMemsetAsync(tmp_counts, 0, kLocalExperts * sizeof(int32_t), stream));
     CHECK_CUDA(cudaMemsetAsync(prepared.reordered_tokens, 0xFF,
+                               max_rows * sizeof(int32_t), stream));
+    CHECK_CUDA(cudaMemsetAsync(prepared.reordered_local_experts, 0xFF,
                                max_rows * sizeof(int32_t), stream));
 
     count_expert_tokens_kernel<<<(t * kTopK + 255) / 256, 256, 0, stream>>>(
@@ -627,6 +641,7 @@ namespace
   // apply the SwiGLU nonlinearity, and scatter expert outputs back to tokens.
   // ---------------------------------------------------------------------------
 
+  // Hidden states: token-major, -> expert GEMM: expert-major reordered rows
   __global__ void fused_gather_dequant_f32_kernel(const __nv_fp8_e4m3 *src,
                                                   const int32_t *token_idx,
                                                   const float *scale_src, float *dst, int64_t m,
@@ -667,26 +682,34 @@ namespace
     c[idx] = x1 * (x2 / (1.0f + expf(-x2)));
   }
 
+  // Token back
   __global__ void optimized_scatter_add_kernel(const float *o, const int32_t *token_idx,
                                                const int32_t *local_expert_idx,
                                                const float *weights, float *output,
                                                const int32_t *total_rows_ptr,
                                                int32_t local_expert_offset)
   {
-    // Accumulate expert outputs back into the original token order with routing weights.
+    // Scatter reordered expert rows back into token-major output order.
+    // Multiple routed rows may target the same token, so accumulation uses atomics.
     int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int32_t total_reordered = total_rows_ptr[0];
-    if (idx >= static_cast<int64_t>(total_reordered) * kHiddenSize)
+    int32_t total_rows = total_rows_ptr[0];
+    if (idx >= static_cast<int64_t>(total_rows) * kHiddenSize)
     {
       return;
     }
+
     int64_t row = idx / kHiddenSize;
+    int64_t col = idx % kHiddenSize;
     int32_t token = token_idx[row];
+    if (token < 0)
+    {
+      return;
+    }
     int32_t local_expert = local_expert_idx[row];
-    float weight =
-        weights[static_cast<int64_t>(token) * kGlobalExperts + local_expert + local_expert_offset];
-    atomicAdd(&output[static_cast<int64_t>(token) * kHiddenSize + (idx % kHiddenSize)],
-              o[idx] * weight);
+    int32_t global_expert = local_expert + local_expert_offset;
+    float weight = weights[static_cast<int64_t>(token) * kGlobalExperts + global_expert];
+    atomicAdd(&output[static_cast<int64_t>(token) * kHiddenSize + col],
+              o[row * kHiddenSize + col] * weight);
   }
 
   // ---------------------------------------------------------------------------
@@ -696,6 +719,7 @@ namespace
   // dispatches either a small SIMT GEMM or a grouped CUTLASS GEMM.
   // ---------------------------------------------------------------------------
 
+  // block-scaled FP8 expert weights -> FP32 matrix 的 kernel
   __global__ void dequant_weights_to_f32_kernel(const __nv_fp8_e4m3 *src, const float *scale,
                                                 float *dst, int64_t num_experts, int64_t n,
                                                 int64_t k)
@@ -747,6 +771,7 @@ namespace
                scale[scale_idx];
   }
 
+  // A @ W13^T -> G1
   template <int TileM, int TileN, int TileK>
   __global__ void gemm1_grouped_variable_fp8_kernel(
       const float *__restrict__ a, const int32_t *__restrict__ expert_offsets,
@@ -1086,8 +1111,8 @@ namespace
     // Step 5. Scatter the reordered expert rows back into token-major output order.
     optimized_scatter_add_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                    256, 0, stream>>>(
-        o_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights, output_fp32,
-        prepared.total_rows, local_expert_offset);
+        o_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights,
+        output_fp32, prepared.total_rows, local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
   }
 
@@ -1186,10 +1211,10 @@ namespace
            255) /
               256,
           256, 0, stream>>>(d_grouped_gemm1_experts,
-                             static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
-                             static_cast<const float *>(gemm1_weights_scale.data_ptr()),
-                             w13_grouped_f32, static_cast<int32_t>(grouped_gemm1.experts.size()),
-                             2 * kIntermediateSize, kHiddenSize);
+                            static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
+                            static_cast<const float *>(gemm1_weights_scale.data_ptr()),
+                            w13_grouped_f32, static_cast<int32_t>(grouped_gemm1.experts.size()),
+                            2 * kIntermediateSize, kHiddenSize);
       CHECK_CUDA(cudaGetLastError());
     }
 
@@ -1204,10 +1229,10 @@ namespace
            255) /
               256,
           256, 0, stream>>>(d_grouped_gemm2_experts,
-                             static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
-                             static_cast<const float *>(gemm2_weights_scale.data_ptr()),
-                             w2_grouped_f32, static_cast<int32_t>(grouped_gemm2.experts.size()),
-                             kHiddenSize, kIntermediateSize);
+                            static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
+                            static_cast<const float *>(gemm2_weights_scale.data_ptr()),
+                            w2_grouped_f32, static_cast<int32_t>(grouped_gemm2.experts.size()),
+                            kHiddenSize, kIntermediateSize);
       CHECK_CUDA(cudaGetLastError());
     }
 
@@ -1352,9 +1377,8 @@ namespace
     }
 
     // Step 8. Scatter the reordered expert outputs back to the final token-major output buffer.
-    optimized_scatter_add_kernel<<<(static_cast<int64_t>(total_reordered) * kHiddenSize + 255) /
-                                       256,
-                                   256, 0, stream>>>(
+    optimized_scatter_add_kernel<<<
+        (static_cast<int64_t>(total_reordered) * kHiddenSize + 255) / 256, 256, 0, stream>>>(
         o_grouped_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights,
         output_fp32, prepared.total_rows, local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
@@ -1418,9 +1442,9 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
                                                         bfloat16_dtype, device);
 
   constexpr int threads_1d = 256;
-  int64_t routing_total = t * kGlobalExperts;
   int64_t output_total = t * kHiddenSize;
 
+  int64_t routing_total = t * kGlobalExperts;
   AsyncBuffer<float> s(static_cast<size_t>(t) * kGlobalExperts, stream);
   AsyncBuffer<float> s_with_bias(static_cast<size_t>(t) * kGlobalExperts, stream);
   AsyncBuffer<int32_t> topk_idx(static_cast<size_t>(t) * kTopK, stream);
@@ -1436,7 +1460,7 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
   CHECK_CUDA(cudaGetLastError());
 
   routing_select_kernel<<<t, 1, 0, stream>>>(s.get(), s_with_bias.get(), topk_idx.get(),
-                                              weights.get(), t, routed_scaling_factor);
+                                             weights.get(), t, routed_scaling_factor);
   CHECK_CUDA(cudaGetLastError());
 
   // Hybrid dispatch: small/medium sequences favor the fully device-side custom path, while
