@@ -588,6 +588,9 @@ namespace
     int32_t *expert_offsets = nullptr;
     int32_t *reordered_tokens = nullptr;
     int32_t *reordered_local_experts = nullptr;
+    int32_t *token_route_counts = nullptr;
+    int32_t *token_route_rows = nullptr;
+    int32_t *token_route_experts = nullptr;
     int32_t *total_rows = nullptr;
   };
 
@@ -781,7 +784,10 @@ namespace
 
   __global__ void reorder_tokens_kernel(const int32_t *topk_idx, const int32_t *expert_offsets,
                                         int32_t *expert_current_counts, int32_t *reordered_tokens,
-                                        int32_t *reordered_local_experts, int64_t t,
+                                        int32_t *reordered_local_experts,
+                                        int32_t *token_route_counts,
+                                        int32_t *token_route_rows,
+                                        int32_t *token_route_experts, int64_t t,
                                         int32_t local_expert_offset)
   {
     // Expand each token's top-k routing decisions into a contiguous expert-major row layout.
@@ -790,6 +796,8 @@ namespace
     {
       return;
     }
+    int32_t local_route_count = 0;
+    bool build_token_routes = token_route_counts != nullptr;
     for (int k = 0; k < kTopK; ++k)
     {
       int32_t global_expert = topk_idx[token_id * kTopK + k];
@@ -800,7 +808,18 @@ namespace
         int32_t pos = expert_offsets[local_expert] + slot;
         reordered_tokens[pos] = static_cast<int32_t>(token_id);
         reordered_local_experts[pos] = local_expert;
+        if (build_token_routes)
+        {
+          int64_t route_pos = token_id * kTopK + local_route_count;
+          token_route_rows[route_pos] = pos;
+          token_route_experts[route_pos] = global_expert;
+          ++local_route_count;
+        }
       }
+    }
+    if (build_token_routes)
+    {
+      token_route_counts[token_id] = local_route_count;
     }
   }
 
@@ -837,8 +856,10 @@ namespace
 
   size_t GetGroupedPrepWorkspaceBytes(int32_t max_rows, size_t scan_workspace_size)
   {
+    size_t max_tokens = static_cast<size_t>(max_rows) / kTopK;
     return sizeof(int32_t) *
-               static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 + 2 * max_rows) +
+               static_cast<size_t>(3 * kLocalExperts + (kLocalExperts + 1) + 1 +
+                                   4 * max_rows + max_tokens) +
            scan_workspace_size;
   }
 
@@ -912,13 +933,21 @@ namespace
   PreparedExpertWorkload PrepareExpertWorkload(const int32_t *topk_idx, int64_t t,
                                                int32_t local_expert_offset, int32_t max_rows,
                                                size_t scan_workspace_size,
-                                               WorkspaceArena *workspace, cudaStream_t stream)
+                                               WorkspaceArena *workspace, cudaStream_t stream,
+                                               bool build_token_routes)
   {
     PreparedExpertWorkload prepared;
     prepared.expert_counts = workspace->Alloc<int32_t>(kLocalExperts);
     prepared.expert_offsets = workspace->Alloc<int32_t>(kLocalExperts + 1);
     prepared.reordered_tokens = workspace->Alloc<int32_t>(max_rows);
     prepared.reordered_local_experts = workspace->Alloc<int32_t>(max_rows);
+    if (build_token_routes)
+    {
+      prepared.token_route_counts =
+          workspace->Alloc<int32_t>(static_cast<size_t>(max_rows) / kTopK);
+      prepared.token_route_rows = workspace->Alloc<int32_t>(max_rows);
+      prepared.token_route_experts = workspace->Alloc<int32_t>(max_rows);
+    }
     int32_t *tmp_counts = workspace->Alloc<int32_t>(kLocalExperts);
     prepared.total_rows = workspace->Alloc<int32_t>(1);
     uint8_t *scan_workspace = workspace->Alloc<uint8_t>(scan_workspace_size);
@@ -944,7 +973,10 @@ namespace
 
     reorder_tokens_kernel<<<t, 1, 0, stream>>>(topk_idx, prepared.expert_offsets, tmp_counts,
                                                prepared.reordered_tokens,
-                                               prepared.reordered_local_experts, t,
+                                               prepared.reordered_local_experts,
+                                               prepared.token_route_counts,
+                                               prepared.token_route_rows,
+                                               prepared.token_route_experts, t,
                                                local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
 
@@ -988,23 +1020,31 @@ namespace
                                                   cutlass::half_t *dst, int64_t m,
                                                   int64_t scale_t)
   {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= m * kHiddenSize)
+    int64_t quad_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total_quads = (m * kHiddenSize) / 4;
+    if (quad_idx >= total_quads)
     {
       return;
     }
+    int64_t idx = quad_idx * 4;
     int64_t row = idx / kHiddenSize;
-    int64_t col = idx % kHiddenSize;
+    int64_t col = idx - row * kHiddenSize;
     int32_t token = token_idx[row];
     if (token < 0)
     {
-      dst[idx] = cutlass::half_t(0.0f);
+      reinterpret_cast<__half2 *>(dst + idx)[0] = __float2half2_rn(0.0f);
+      reinterpret_cast<__half2 *>(dst + idx + 2)[0] = __float2half2_rn(0.0f);
       return;
     }
     float scale = scale_src[static_cast<int64_t>(col / kBlock) * scale_t + token];
-    dst[idx] =
-        cutlass::half_t(fp8_to_float(src[static_cast<int64_t>(token) * kHiddenSize + col]) *
-                        scale);
+    __nv_fp8x4_e4m3 packed =
+        reinterpret_cast<const __nv_fp8x4_e4m3 *>(
+            src + static_cast<int64_t>(token) * kHiddenSize + col)[0];
+    float4 values = static_cast<float4>(packed);
+    reinterpret_cast<__half2 *>(dst + idx)[0] =
+        __floats2half2_rn(values.x * scale, values.y * scale);
+    reinterpret_cast<__half2 *>(dst + idx + 2)[0] =
+        __floats2half2_rn(values.z * scale, values.w * scale);
   }
 
   __global__ void swiglu_f32_kernel(const float *g1, float *c, const int32_t *total_rows_ptr)
@@ -1051,6 +1091,35 @@ namespace
     float weight = weights[static_cast<int64_t>(token) * kGlobalExperts + global_expert];
     atomicAdd(&output[static_cast<int64_t>(token) * kHiddenSize + col],
               o[row * kHiddenSize + col] * weight);
+  }
+
+  __global__ void final_reduce_cast_grouped_kernel(const float *o,
+                                                   const int32_t *token_route_counts,
+                                                   const int32_t *token_route_rows,
+                                                   const int32_t *token_route_experts,
+                                                   const float *weights,
+                                                   __nv_bfloat16 *output_bf16, int64_t t)
+  {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t total = t * kHiddenSize;
+    if (idx >= total)
+    {
+      return;
+    }
+
+    int64_t token = idx / kHiddenSize;
+    int64_t col = idx - token * kHiddenSize;
+    int64_t route_base = token * kTopK;
+    int32_t route_count = token_route_counts[token];
+    float acc = 0.0f;
+    for (int32_t route = 0; route < route_count; ++route)
+    {
+      int32_t row = token_route_rows[route_base + route];
+      int32_t global_expert = token_route_experts[route_base + route];
+      float weight = weights[token * kGlobalExperts + global_expert];
+      acc += o[static_cast<int64_t>(row) * kHiddenSize + col] * weight;
+    }
+    output_bf16[idx] = __float2bfloat16(acc);
   }
 
   // ---------------------------------------------------------------------------
@@ -1108,13 +1177,19 @@ namespace
     int64_t tile_base = static_cast<int64_t>(n_block) * kBlock * k +
                         static_cast<int64_t>(k_block) * kBlock;
 
-    constexpr int32_t tile_values = static_cast<int32_t>(kBlock * kBlock);
-    for (int32_t linear = threadIdx.x; linear < tile_values; linear += blockDim.x)
+    constexpr int32_t tile_quads = static_cast<int32_t>((kBlock * kBlock) / 4);
+    for (int32_t quad = threadIdx.x; quad < tile_quads; quad += blockDim.x)
     {
+      int32_t linear = quad * 4;
       int64_t row = linear / kBlock;
       int64_t col = linear - row * kBlock;
       int64_t offset = tile_base + row * k + col;
-      dst[expert_dst_base + offset] = fp8_to_float(src[expert_src_base + offset]) * tile_scale;
+      __nv_fp8x4_e4m3 packed =
+          reinterpret_cast<const __nv_fp8x4_e4m3 *>(src + expert_src_base + offset)[0];
+      float4 values = static_cast<float4>(packed);
+      reinterpret_cast<float4 *>(dst + expert_dst_base + offset)[0] =
+          make_float4(values.x * tile_scale, values.y * tile_scale, values.z * tile_scale,
+                      values.w * tile_scale);
     }
   }
 
@@ -1142,14 +1217,20 @@ namespace
     int64_t tile_base = static_cast<int64_t>(n_block) * kBlock * k +
                         static_cast<int64_t>(k_block) * kBlock;
 
-    constexpr int32_t tile_values = static_cast<int32_t>(kBlock * kBlock);
-    for (int32_t linear = threadIdx.x; linear < tile_values; linear += blockDim.x)
+    constexpr int32_t tile_quads = static_cast<int32_t>((kBlock * kBlock) / 4);
+    for (int32_t quad = threadIdx.x; quad < tile_quads; quad += blockDim.x)
     {
+      int32_t linear = quad * 4;
       int64_t row = linear / kBlock;
       int64_t col = linear - row * kBlock;
       int64_t offset = tile_base + row * k + col;
-      dst[expert_dst_base + offset] =
-          cutlass::half_t(fp8_to_float(src[expert_src_base + offset]) * tile_scale);
+      __nv_fp8x4_e4m3 packed =
+          reinterpret_cast<const __nv_fp8x4_e4m3 *>(src + expert_src_base + offset)[0];
+      float4 values = static_cast<float4>(packed);
+      reinterpret_cast<__half2 *>(dst + expert_dst_base + offset)[0] =
+          __floats2half2_rn(values.x * tile_scale, values.y * tile_scale);
+      reinterpret_cast<__half2 *>(dst + expert_dst_base + offset + 2)[0] =
+          __floats2half2_rn(values.z * tile_scale, values.w * tile_scale);
     }
   }
 
@@ -1629,7 +1710,7 @@ namespace
     }
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
-                              &workspace, stream);
+                              &workspace, stream, false);
     if (profile_enabled)
     {
       profile.prepare.Stop(stream);
@@ -1718,7 +1799,7 @@ namespace
       const ffi::TensorView &hidden_states, const ffi::TensorView &hidden_states_scale,
       const ffi::TensorView &gemm1_weights, const ffi::TensorView &gemm1_weights_scale,
       const ffi::TensorView &gemm2_weights, const ffi::TensorView &gemm2_weights_scale,
-      int32_t *topk_idx, float *weights, float *output_fp32, int64_t t,
+      int32_t *topk_idx, float *weights, __nv_bfloat16 *output_bf16, int64_t t,
       int32_t local_expert_offset, cudaStream_t stream)
   {
     // Grouped path: reuse the same workload preparation, compact valid rows, then run
@@ -1747,7 +1828,7 @@ namespace
     }
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
-                              &prep_workspace, stream);
+                              &prep_workspace, stream, true);
     if (profile_enabled)
     {
       profile.prepare.Stop(stream);
@@ -1822,7 +1903,8 @@ namespace
       profile.gather.Start(stream);
     }
     fused_gather_dequant_f16_kernel<<<
-        (static_cast<int64_t>(total_reordered) * kHiddenSize + 255) / 256, 256, 0, stream>>>(
+        ((static_cast<int64_t>(total_reordered) * kHiddenSize) / 4 + 255) / 256, 256, 0,
+        stream>>>(
         static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
         static_cast<const float *>(hidden_states_scale.data_ptr()), a_f16, total_reordered,
         scale_t);
@@ -2021,15 +2103,15 @@ namespace
       profile.gemm2_grouped.Stop(stream);
     }
 
-    // Step 8. Scatter the reordered expert outputs back to the final token-major output buffer.
+    // Step 8. Reduce each token's local routed rows and cast directly to the final BF16 output.
     if (profile_enabled)
     {
       profile.scatter.Start(stream);
     }
-    optimized_scatter_add_kernel<<<
-        (static_cast<int64_t>(total_reordered) * kHiddenSize + 255) / 256, 256, 0, stream>>>(
-        o_grouped_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights,
-        output_fp32, prepared.total_rows, local_expert_offset);
+    final_reduce_cast_grouped_kernel<<<(static_cast<int64_t>(t) * kHiddenSize + 255) / 256, 256,
+                                       0, stream>>>(
+        o_grouped_f32, prepared.token_route_counts, prepared.token_route_rows,
+        prepared.token_route_experts, weights, output_bf16, t);
     CHECK_CUDA(cudaGetLastError());
     if (profile_enabled)
     {
@@ -2099,6 +2181,7 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
 
   constexpr int threads_1d = 256;
   int64_t output_total = t * kHiddenSize;
+  bool use_device_only_path = t <= kHybridDispatchSeqLenThreshold;
 
   int64_t routing_total = t * kGlobalExperts;
   static thread_local CachedDeviceBuffer<float> s_cache;
@@ -2110,10 +2193,14 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
   float *s_with_bias = s_with_bias_cache.get(static_cast<size_t>(t) * kGlobalExperts);
   int32_t *topk_idx = topk_idx_cache.get(static_cast<size_t>(t) * kTopK);
   float *weights = weights_cache.get(static_cast<size_t>(t) * kGlobalExperts);
-  float *output_fp32 = output_fp32_cache.get(static_cast<size_t>(t) * kHiddenSize);
+  float *output_fp32 = nullptr;
 
-  CHECK_CUDA(cudaMemsetAsync(output_fp32, 0,
-                             sizeof(float) * static_cast<size_t>(t) * kHiddenSize, stream));
+  if (use_device_only_path)
+  {
+    output_fp32 = output_fp32_cache.get(static_cast<size_t>(t) * kHiddenSize);
+    CHECK_CUDA(cudaMemsetAsync(output_fp32, 0,
+                               sizeof(float) * static_cast<size_t>(t) * kHiddenSize, stream));
+  }
   CHECK_CUDA(cudaMemsetAsync(weights, 0,
                              sizeof(float) * static_cast<size_t>(t) * kGlobalExperts, stream));
 
@@ -2129,22 +2216,24 @@ ffi::Tensor kernel(const ffi::TensorView &routing_logits, const ffi::TensorView 
   // Hybrid dispatch: small/medium sequences favor the fully device-side custom path, while
   // large sequences still amortize the host-side planning needed for the split
   // between small-expert SIMT fallback and grouped CUTLASS TensorOp launches.
-  if (t <= kHybridDispatchSeqLenThreshold)
+  if (use_device_only_path)
   {
     RunDeviceOnlyGroupedPipeline(hidden_states, hidden_states_scale, gemm1_weights,
                                  gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
                                  topk_idx, weights, output_fp32, t, local_expert_offset, stream);
+    cast_output_kernel<<<(output_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
+        output_fp32, static_cast<__nv_bfloat16 *>(output_tensor.data_ptr()), output_total);
+    CHECK_CUDA(cudaGetLastError());
   }
   else
   {
     RunGroupedWorkloadPipeline(hidden_states, hidden_states_scale, gemm1_weights,
                                gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
-                               topk_idx, weights, output_fp32, t, local_expert_offset, stream);
+                               topk_idx, weights,
+                               static_cast<__nv_bfloat16 *>(output_tensor.data_ptr()), t,
+                               local_expert_offset, stream);
   }
 
-  cast_output_kernel<<<(output_total + threads_1d - 1) / threads_1d, threads_1d, 0, stream>>>(
-      output_fp32, static_cast<__nv_bfloat16 *>(output_tensor.data_ptr()), output_total);
-  CHECK_CUDA(cudaGetLastError());
   CHECK_CUDA(cudaStreamSynchronize(stream));
 
   return output_tensor;
