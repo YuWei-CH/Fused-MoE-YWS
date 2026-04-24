@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -46,9 +47,11 @@ namespace
   constexpr int kGemm2TileM = 16;
   constexpr int kGemm2TileN = 32;
   constexpr int kGemm2TileK = 64;
-  constexpr int64_t kHybridDispatchSeqLenThreshold = 4096;
-  constexpr int kGroupedGemm1Threshold = 32;
-  constexpr int kGroupedGemm2Threshold = 32;
+  constexpr int64_t kHybridDispatchSeqLenThreshold = 512;
+  constexpr int kGroupedGemm1Threshold = 1;
+  constexpr int kGroupedGemm2Threshold = 1;
+  constexpr int kSelectedDequantThreads = 128;
+  constexpr bool kUseGroupedF16Gemm1 = true;
 
 #define CHECK_CUDA(expr)                                                             \
   do                                                                                 \
@@ -320,6 +323,28 @@ namespace
             cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 4>::GemmKernel>;
 
   } // namespace cutlass_grouped_f32
+
+  namespace cutlass_grouped_f16
+  {
+
+    using ElementA = cutlass::half_t;
+    using ElementB = cutlass::half_t;
+    using ElementC = float;
+    using ElementAccumulator = float;
+
+    using GemmGrouped = cutlass::gemm::device::GemmGrouped<
+        typename cutlass::gemm::kernel::DefaultGemmGrouped<
+            ElementA, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone, 8, ElementB,
+            cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone, 8, ElementC,
+            cutlass::layout::RowMajor, ElementAccumulator, cutlass::arch::OpClassTensorOp,
+            cutlass::arch::Sm80, cutlass::gemm::GemmShape<128, 128, 32>,
+            cutlass::gemm::GemmShape<64, 64, 32>, cutlass::gemm::GemmShape<16, 8, 16>,
+            cutlass::epilogue::thread::LinearCombination<
+                ElementC, 128 / cutlass::sizeof_bits<ElementC>::value, ElementAccumulator,
+                ElementAccumulator>,
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>, 4>::GemmKernel>;
+
+  } // namespace cutlass_grouped_f16
 
   // ---------------------------------------------------------------------------
   // Validation and lightweight CUDA memory helpers.
@@ -824,10 +849,26 @@ namespace
         grouped_gemm1_count * static_cast<size_t>(2 * kIntermediateSize) * kHiddenSize;
     size_t grouped_gemm2_weight_values =
         grouped_gemm2_count * static_cast<size_t>(kHiddenSize) * kIntermediateSize;
+    if constexpr (kUseGroupedF16Gemm1)
+    {
+      return sizeof(float) * static_cast<size_t>(total_rows) *
+                 (2 * kIntermediateSize + kIntermediateSize + kHiddenSize) +
+             sizeof(cutlass::half_t) * grouped_gemm1_weight_values +
+             sizeof(float) * grouped_gemm2_weight_values +
+             sizeof(int32_t) * (grouped_gemm1_count + grouped_gemm2_count);
+    }
+    size_t small_weight_values = 0;
+    if constexpr (kGroupedGemm1Threshold > 1)
+    {
+      small_weight_values += static_cast<size_t>(2 * kIntermediateSize) * kHiddenSize;
+    }
+    if constexpr (kGroupedGemm2Threshold > 1)
+    {
+      small_weight_values += static_cast<size_t>(kHiddenSize) * kIntermediateSize;
+    }
     return sizeof(float) * static_cast<size_t>(total_rows) *
                (2 * kIntermediateSize + kIntermediateSize + kHiddenSize) +
-           sizeof(float) * (2 * kIntermediateSize * kHiddenSize +
-                            kHiddenSize * kIntermediateSize) +
+           sizeof(float) * small_weight_values +
            sizeof(float) * (grouped_gemm1_weight_values + grouped_gemm2_weight_values) +
            sizeof(int32_t) * (grouped_gemm1_count + grouped_gemm2_count);
   }
@@ -941,6 +982,31 @@ namespace
     dst[idx] = fp8_to_float(src[static_cast<int64_t>(token) * kHiddenSize + col]) * scale;
   }
 
+  __global__ void fused_gather_dequant_f16_kernel(const __nv_fp8_e4m3 *src,
+                                                  const int32_t *token_idx,
+                                                  const float *scale_src,
+                                                  cutlass::half_t *dst, int64_t m,
+                                                  int64_t scale_t)
+  {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= m * kHiddenSize)
+    {
+      return;
+    }
+    int64_t row = idx / kHiddenSize;
+    int64_t col = idx % kHiddenSize;
+    int32_t token = token_idx[row];
+    if (token < 0)
+    {
+      dst[idx] = cutlass::half_t(0.0f);
+      return;
+    }
+    float scale = scale_src[static_cast<int64_t>(col / kBlock) * scale_t + token];
+    dst[idx] =
+        cutlass::half_t(fp8_to_float(src[static_cast<int64_t>(token) * kHiddenSize + col]) *
+                        scale);
+  }
+
   __global__ void swiglu_f32_kernel(const float *g1, float *c, const int32_t *total_rows_ptr)
   {
     // Apply the gate/up projection epilogue: swiglu(x1, x2) = x1 * silu(x2).
@@ -1018,32 +1084,73 @@ namespace
     dst[idx] = fp8_to_float(src[idx]) * scale[scale_idx];
   }
 
-  __global__ void dequant_selected_experts_to_f32_kernel(const int32_t *expert_ids,
-                                                         const __nv_fp8_e4m3 *src,
-                                                         const float *scale, float *dst,
-                                                         int32_t num_selected, int64_t n,
-                                                         int64_t k)
+  __global__ void dequant_selected_experts_blocks_to_f32_kernel(
+      const int32_t *__restrict__ expert_ids, const __nv_fp8_e4m3 *__restrict__ src,
+      const float *__restrict__ scale, float *__restrict__ dst, int32_t num_selected, int64_t n,
+      int64_t k)
   {
-    // Dequantize an arbitrary list of experts into a compact FP32 buffer used by
-    // the grouped GEMM path. expert_ids[selected_slot] defines which expert each
-    // destination slice corresponds to.
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t expert_size = n * k;
-    if (idx >= static_cast<int64_t>(num_selected) * expert_size)
+    // One CUDA block owns one 128x128 block-scaled tile for one selected expert.
+    int32_t k_block = blockIdx.x;
+    int32_t n_block = blockIdx.y;
+    int32_t selected_slot = blockIdx.z;
+    if (selected_slot >= num_selected)
     {
       return;
     }
-    int32_t selected_slot = static_cast<int32_t>(idx / expert_size);
     int32_t local_expert = expert_ids[selected_slot];
-    int64_t offset = idx % expert_size;
-    int64_t row = offset / k;
-    int64_t col = offset % k;
     int64_t n_blocks = n / kBlock;
     int64_t k_blocks = k / kBlock;
-    int64_t scale_idx = static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
-                        (row / kBlock) * k_blocks + (col / kBlock);
-    dst[idx] = fp8_to_float(src[static_cast<int64_t>(local_expert) * expert_size + offset]) *
-               scale[scale_idx];
+    float tile_scale = scale[static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
+                             static_cast<int64_t>(n_block) * k_blocks + k_block];
+    int64_t expert_size = n * k;
+    int64_t expert_src_base = static_cast<int64_t>(local_expert) * expert_size;
+    int64_t expert_dst_base = static_cast<int64_t>(selected_slot) * expert_size;
+    int64_t tile_base = static_cast<int64_t>(n_block) * kBlock * k +
+                        static_cast<int64_t>(k_block) * kBlock;
+
+    constexpr int32_t tile_values = static_cast<int32_t>(kBlock * kBlock);
+    for (int32_t linear = threadIdx.x; linear < tile_values; linear += blockDim.x)
+    {
+      int64_t row = linear / kBlock;
+      int64_t col = linear - row * kBlock;
+      int64_t offset = tile_base + row * k + col;
+      dst[expert_dst_base + offset] = fp8_to_float(src[expert_src_base + offset]) * tile_scale;
+    }
+  }
+
+  __global__ void dequant_selected_experts_blocks_to_f16_kernel(
+      const int32_t *__restrict__ expert_ids, const __nv_fp8_e4m3 *__restrict__ src,
+      const float *__restrict__ scale, cutlass::half_t *__restrict__ dst, int32_t num_selected,
+      int64_t n, int64_t k)
+  {
+    // One CUDA block owns one 128x128 block-scaled tile for one selected expert.
+    int32_t k_block = blockIdx.x;
+    int32_t n_block = blockIdx.y;
+    int32_t selected_slot = blockIdx.z;
+    if (selected_slot >= num_selected)
+    {
+      return;
+    }
+    int32_t local_expert = expert_ids[selected_slot];
+    int64_t n_blocks = n / kBlock;
+    int64_t k_blocks = k / kBlock;
+    float tile_scale = scale[static_cast<int64_t>(local_expert) * n_blocks * k_blocks +
+                             static_cast<int64_t>(n_block) * k_blocks + k_block];
+    int64_t expert_size = n * k;
+    int64_t expert_src_base = static_cast<int64_t>(local_expert) * expert_size;
+    int64_t expert_dst_base = static_cast<int64_t>(selected_slot) * expert_size;
+    int64_t tile_base = static_cast<int64_t>(n_block) * kBlock * k +
+                        static_cast<int64_t>(k_block) * kBlock;
+
+    constexpr int32_t tile_values = static_cast<int32_t>(kBlock * kBlock);
+    for (int32_t linear = threadIdx.x; linear < tile_values; linear += blockDim.x)
+    {
+      int64_t row = linear / kBlock;
+      int64_t col = linear - row * kBlock;
+      int64_t offset = tile_base + row * k + col;
+      dst[expert_dst_base + offset] =
+          cutlass::half_t(fp8_to_float(src[expert_src_base + offset]) * tile_scale);
+    }
   }
 
   // A @ W13^T -> G1
@@ -1360,6 +1467,106 @@ namespace
                    d_ptr_c.get(), d_ptr_d.get(), expert_count, k, n, stream);
   }
 
+  void RunGroupedGemmF16(cutlass::gemm::GemmCoord *d_problem_sizes,
+                         cutlass::gemm::GemmCoord *h_problem_sizes,
+                         cutlass_grouped_f16::ElementA **ptr_a,
+                         cutlass_grouped_f16::ElementB **ptr_b,
+                         cutlass_grouped_f16::ElementC **ptr_c,
+                         cutlass_grouped_f16::ElementC **ptr_d, int expert_count, int k, int n,
+                         cudaStream_t stream)
+  {
+    if (expert_count == 0)
+    {
+      return;
+    }
+    using GemmGrouped = cutlass_grouped_f16::GemmGrouped;
+    using LongIndex = typename GemmGrouped::LayoutA::Stride::LongIndex;
+    std::vector<LongIndex> lda(expert_count, k);
+    std::vector<LongIndex> ldb(expert_count, k);
+    std::vector<LongIndex> ldc(expert_count, n);
+    std::vector<LongIndex> ldd(expert_count, n);
+    AsyncBuffer<LongIndex> d_lda(expert_count, stream);
+    AsyncBuffer<LongIndex> d_ldb(expert_count, stream);
+    AsyncBuffer<LongIndex> d_ldc(expert_count, stream);
+    AsyncBuffer<LongIndex> d_ldd(expert_count, stream);
+    CHECK_CUDA(cudaMemcpyAsync(d_lda.get(), lda.data(), expert_count * sizeof(LongIndex),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ldb.get(), ldb.data(), expert_count * sizeof(LongIndex),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ldc.get(), ldc.data(), expert_count * sizeof(LongIndex),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ldd.get(), ldd.data(), expert_count * sizeof(LongIndex),
+                               cudaMemcpyHostToDevice, stream));
+    typename GemmGrouped::Arguments args(
+        d_problem_sizes, expert_count, 1024, {1.0f, 0.0f}, ptr_a, ptr_b, ptr_c, ptr_d,
+        d_lda.get(), d_ldb.get(), d_ldc.get(), d_ldd.get(), h_problem_sizes);
+
+    GemmGrouped gemm_op;
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    AsyncBuffer<uint8_t> workspace(workspace_size, stream);
+    CheckCutlassStatus(gemm_op.initialize(args, workspace.get(), stream), "Grouped F16 GEMM init");
+    CheckCutlassStatus(gemm_op.run(stream), "Grouped F16 GEMM run");
+  }
+
+  void RunSelectedGroupedGemmF16(const std::vector<int32_t> &experts,
+                                 const std::vector<int32_t> &expert_counts,
+                                 const std::vector<int32_t> &expert_offsets,
+                                 const cutlass::half_t *a_base, int a_stride,
+                                 const cutlass::half_t *b_compact, int b_stride, float *d_base,
+                                 int d_stride, int n, int k, cudaStream_t stream)
+  {
+    int expert_count = static_cast<int>(experts.size());
+    if (expert_count == 0)
+    {
+      return;
+    }
+
+    std::vector<cutlass::gemm::GemmCoord> h_problem_sizes(expert_count);
+    std::vector<cutlass_grouped_f16::ElementA *> h_ptr_a(expert_count);
+    std::vector<cutlass_grouped_f16::ElementB *> h_ptr_b(expert_count);
+    std::vector<cutlass_grouped_f16::ElementC *> h_ptr_c(expert_count);
+    std::vector<cutlass_grouped_f16::ElementC *> h_ptr_d(expert_count);
+
+    for (int slot = 0; slot < expert_count; ++slot)
+    {
+      int32_t expert = experts[slot];
+      int32_t rows = expert_counts[expert];
+      int32_t row_offset = expert_offsets[expert];
+      h_problem_sizes[slot] = cutlass::gemm::GemmCoord(rows, n, k);
+      h_ptr_a[slot] =
+          const_cast<cutlass::half_t *>(a_base + static_cast<int64_t>(row_offset) * a_stride);
+      h_ptr_b[slot] =
+          const_cast<cutlass::half_t *>(b_compact + static_cast<int64_t>(slot) * b_stride);
+      h_ptr_c[slot] = d_base + static_cast<int64_t>(row_offset) * d_stride;
+      h_ptr_d[slot] = d_base + static_cast<int64_t>(row_offset) * d_stride;
+    }
+
+    AsyncBuffer<cutlass::gemm::GemmCoord> d_problem_sizes(expert_count, stream);
+    AsyncBuffer<cutlass_grouped_f16::ElementA *> d_ptr_a(expert_count, stream);
+    AsyncBuffer<cutlass_grouped_f16::ElementB *> d_ptr_b(expert_count, stream);
+    AsyncBuffer<cutlass_grouped_f16::ElementC *> d_ptr_c(expert_count, stream);
+    AsyncBuffer<cutlass_grouped_f16::ElementC *> d_ptr_d(expert_count, stream);
+
+    CHECK_CUDA(cudaMemcpyAsync(d_problem_sizes.get(), h_problem_sizes.data(),
+                               expert_count * sizeof(cutlass::gemm::GemmCoord),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ptr_a.get(), h_ptr_a.data(),
+                               expert_count * sizeof(cutlass_grouped_f16::ElementA *),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ptr_b.get(), h_ptr_b.data(),
+                               expert_count * sizeof(cutlass_grouped_f16::ElementB *),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ptr_c.get(), h_ptr_c.data(),
+                               expert_count * sizeof(cutlass_grouped_f16::ElementC *),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(d_ptr_d.get(), h_ptr_d.data(),
+                               expert_count * sizeof(cutlass_grouped_f16::ElementC *),
+                               cudaMemcpyHostToDevice, stream));
+
+    RunGroupedGemmF16(d_problem_sizes.get(), h_problem_sizes.data(), d_ptr_a.get(),
+                      d_ptr_b.get(), d_ptr_c.get(), d_ptr_d.get(), expert_count, k, n, stream);
+  }
+
   template <int TileM, int TileN, int TileK>
   void LaunchGroupedFp8Gemm1(const float *a_f32, const int32_t *expert_offsets,
                              const int32_t *expert_counts,
@@ -1514,10 +1721,8 @@ namespace
       int32_t *topk_idx, float *weights, float *output_fp32, int64_t t,
       int32_t local_expert_offset, cudaStream_t stream)
   {
-    // Large-sequence path:
-    // reuse the same workload preparation, then split experts into:
-    // - small experts: dequantize one expert and run a SIMT GEMM
-    // - large experts: dequantize selected weights once and run CUTLASS TensorOp grouped GEMM
+    // Grouped path: reuse the same workload preparation, compact valid rows, then run
+    // non-empty experts through dequantization plus CUTLASS TensorOp grouped GEMM.
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
     bool profile_enabled = ProfileEnabled();
@@ -1567,23 +1772,7 @@ namespace
                                kLocalExperts * sizeof(int32_t), cudaMemcpyDeviceToHost,
                                host_copy_stream));
 
-    // Step 3. Start gathering activations immediately while the host-side counts transfer runs.
-    static thread_local CachedDeviceBuffer<float> grouped_a_cache;
-    float *a_f32 = grouped_a_cache.get(static_cast<size_t>(max_rows) * kHiddenSize);
-    if (profile_enabled)
-    {
-      profile.gather.Start(stream);
-    }
-    fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
-                                      256, 0, stream>>>(
-        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
-        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, max_rows, scale_t);
-    CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.gather.Stop(stream);
-    }
-
+    // Step 3. Wait for the compact expert counts so later stages only touch valid rows.
     CHECK_CUDA(cudaStreamSynchronize(host_copy_stream));
     CHECK_CUDA(cudaEventDestroy(workload_ready_event));
     CHECK_CUDA(cudaStreamDestroy(host_copy_stream));
@@ -1622,6 +1811,27 @@ namespace
       return;
     }
 
+    // Step 4. Gather/dequantize only the valid reordered rows into FP16 for GEMM1. Large
+    // workloads have far fewer actual routed rows than the padded t * top_k capacity.
+    float *a_f32 = nullptr;
+    static thread_local CachedDeviceBuffer<cutlass::half_t> grouped_a_cache;
+    cutlass::half_t *a_f16 =
+        grouped_a_cache.get(static_cast<size_t>(total_reordered) * kHiddenSize);
+    if (profile_enabled)
+    {
+      profile.gather.Start(stream);
+    }
+    fused_gather_dequant_f16_kernel<<<
+        (static_cast<int64_t>(total_reordered) * kHiddenSize + 255) / 256, 256, 0, stream>>>(
+        static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
+        static_cast<const float *>(hidden_states_scale.data_ptr()), a_f16, total_reordered,
+        scale_t);
+    CHECK_CUDA(cudaGetLastError());
+    if (profile_enabled)
+    {
+      profile.gather.Stop(stream);
+    }
+
     size_t compute_workspace_bytes = GetGroupedComputeWorkspaceBytes(
         total_reordered, grouped_gemm1.experts.size(), grouped_gemm2.experts.size());
     static thread_local CachedDeviceBuffer<uint8_t> grouped_compute_workspace_cache;
@@ -1631,9 +1841,17 @@ namespace
         static_cast<size_t>(total_reordered) * 2 * kIntermediateSize);
     float *c_f32 =
         compute_workspace.Alloc<float>(static_cast<size_t>(total_reordered) * kIntermediateSize);
-    float *w13_small_tmp = compute_workspace.Alloc<float>(2 * kIntermediateSize * kHiddenSize);
-    float *w2_small_tmp = compute_workspace.Alloc<float>(kHiddenSize * kIntermediateSize);
-    float *w13_grouped_f32 = compute_workspace.Alloc<float>(
+    float *w13_small_tmp = nullptr;
+    float *w2_small_tmp = nullptr;
+    if constexpr (kGroupedGemm1Threshold > 1)
+    {
+      w13_small_tmp = compute_workspace.Alloc<float>(2 * kIntermediateSize * kHiddenSize);
+    }
+    if constexpr (kGroupedGemm2Threshold > 1)
+    {
+      w2_small_tmp = compute_workspace.Alloc<float>(kHiddenSize * kIntermediateSize);
+    }
+    cutlass::half_t *w13_grouped_f16 = compute_workspace.Alloc<cutlass::half_t>(
         grouped_gemm1.experts.size() * static_cast<size_t>(2 * kIntermediateSize) * kHiddenSize);
     float *w2_grouped_f32 = compute_workspace.Alloc<float>(
         grouped_gemm2.experts.size() * static_cast<size_t>(kHiddenSize) * kIntermediateSize);
@@ -1642,39 +1860,40 @@ namespace
     int32_t *d_grouped_experts1 = compute_workspace.Alloc<int32_t>(grouped_gemm1.experts.size());
     int32_t *d_grouped_experts2 = compute_workspace.Alloc<int32_t>(grouped_gemm2.experts.size());
 
-    // Step 5. Execute GEMM1 using a mixed strategy:
-    // tiny experts use the SIMT fallback, large experts use compact dequant + CUTLASS TC.
+    // Step 5. Execute GEMM1. The SIMT fallback remains compiled for higher thresholds, but the
+    // current threshold sends every non-empty expert to compact dequant + CUTLASS TC.
     if (profile_enabled)
     {
       profile.gemm1_small.Start(stream);
     }
-    for (int i = 0; i < kLocalExperts; ++i)
+    if constexpr (kGroupedGemm1Threshold > 1)
     {
-      if (h_counts[i] <= 0)
+      for (int i = 0; i < kLocalExperts; ++i)
       {
-        continue;
-      }
-      if (h_counts[i] < kGroupedGemm1Threshold)
-      {
-        if (profile_enabled)
+        if (h_counts[i] <= 0)
         {
-          ++profile.small_gemm1_experts;
+          continue;
         }
-        // Small expert: materialize just one expert's weights and run the SIMT fallback.
-        dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize +
-                                         255) /
-                                            256,
-                                        256, 0, stream>>>(
-            static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()) +
-                static_cast<int64_t>(i) * 2 * kIntermediateSize * kHiddenSize,
-            static_cast<const float *>(gemm1_weights_scale.data_ptr()) +
-                static_cast<int64_t>(i) * ((2 * kIntermediateSize) / kBlock) *
-                    (kHiddenSize / kBlock),
-            w13_small_tmp, 1, 2 * kIntermediateSize, kHiddenSize);
-        CHECK_CUDA(cudaGetLastError());
-        RunGemmF32(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize, w13_small_tmp,
-                   g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
-                   h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
+        if (h_counts[i] < kGroupedGemm1Threshold)
+        {
+          if (profile_enabled)
+          {
+            ++profile.small_gemm1_experts;
+          }
+          // Small expert: materialize just one expert's weights and run the SIMT fallback.
+          dequant_weights_to_f32_kernel<<<
+              (static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize + 255) / 256, 256, 0,
+              stream>>>(static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()) +
+                            static_cast<int64_t>(i) * 2 * kIntermediateSize * kHiddenSize,
+                        static_cast<const float *>(gemm1_weights_scale.data_ptr()) +
+                            static_cast<int64_t>(i) * ((2 * kIntermediateSize) / kBlock) *
+                                (kHiddenSize / kBlock),
+                        w13_small_tmp, 1, 2 * kIntermediateSize, kHiddenSize);
+          CHECK_CUDA(cudaGetLastError());
+          RunGemmF32(a_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize, w13_small_tmp,
+                     g1_f32 + static_cast<int64_t>(h_offsets[i]) * 2 * kIntermediateSize,
+                     h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
+        }
       }
     }
     if (profile_enabled)
@@ -1688,12 +1907,13 @@ namespace
       CHECK_CUDA(cudaMemcpyAsync(d_grouped_experts1, grouped_gemm1.experts.data(),
                                  grouped_gemm1.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
-      int64_t grouped_gemm1_values = static_cast<int64_t>(grouped_gemm1.experts.size()) *
-                                     2 * kIntermediateSize * kHiddenSize;
-      dequant_selected_experts_to_f32_kernel<<<(grouped_gemm1_values + 255) / 256, 256, 0,
-                                               stream>>>(
+      dim3 dequant_grid(static_cast<unsigned int>(kHiddenSize / kBlock),
+                         static_cast<unsigned int>((2 * kIntermediateSize) / kBlock),
+                         static_cast<unsigned int>(grouped_gemm1.experts.size()));
+      dequant_selected_experts_blocks_to_f16_kernel<<<dequant_grid, kSelectedDequantThreads, 0,
+                                                      stream>>>(
           d_grouped_experts1, static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
-          static_cast<const float *>(gemm1_weights_scale.data_ptr()), w13_grouped_f32,
+          static_cast<const float *>(gemm1_weights_scale.data_ptr()), w13_grouped_f16,
           static_cast<int32_t>(grouped_gemm1.experts.size()), 2 * kIntermediateSize,
           kHiddenSize);
       CHECK_CUDA(cudaGetLastError());
@@ -1706,11 +1926,9 @@ namespace
 
     if (!grouped_gemm1.experts.empty())
     {
-      RunSelectedGroupedGemmF32(grouped_gemm1.experts, h_counts, h_offsets, a_f32, kHiddenSize,
-                                w13_grouped_f32,
-                                2 * kIntermediateSize * kHiddenSize, g1_f32,
-                                2 * kIntermediateSize, 2 * kIntermediateSize, kHiddenSize,
-                                stream);
+      RunSelectedGroupedGemmF16(grouped_gemm1.experts, h_counts, h_offsets, a_f16, kHiddenSize,
+                                w13_grouped_f16, 2 * kIntermediateSize * kHiddenSize, g1_f32,
+                                2 * kIntermediateSize, 2 * kIntermediateSize, kHiddenSize, stream);
     }
     if (profile_enabled)
     {
@@ -1730,36 +1948,38 @@ namespace
       profile.swiglu.Stop(stream);
     }
 
-    // Step 7. Execute GEMM2 with the same small-expert / large-expert split.
+    // Step 7. Execute GEMM2 with the same grouped-expert policy.
     if (profile_enabled)
     {
       profile.gemm2_small.Start(stream);
     }
-    for (int i = 0; i < kLocalExperts; ++i)
+    if constexpr (kGroupedGemm2Threshold > 1)
     {
-      if (h_counts[i] <= 0)
+      for (int i = 0; i < kLocalExperts; ++i)
       {
-        continue;
-      }
-      if (h_counts[i] < kGroupedGemm2Threshold)
-      {
-        if (profile_enabled)
+        if (h_counts[i] <= 0)
         {
-          ++profile.small_gemm2_experts;
+          continue;
         }
-        dequant_weights_to_f32_kernel<<<(static_cast<int64_t>(kHiddenSize) * kIntermediateSize +
-                                         255) /
-                                            256,
-                                        256, 0, stream>>>(
-            static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()) +
-                static_cast<int64_t>(i) * kHiddenSize * kIntermediateSize,
-            static_cast<const float *>(gemm2_weights_scale.data_ptr()) +
-                static_cast<int64_t>(i) * (kHiddenSize / kBlock) * (kIntermediateSize / kBlock),
-            w2_small_tmp, 1, kHiddenSize, kIntermediateSize);
-        CHECK_CUDA(cudaGetLastError());
-        RunGemmF32(c_f32 + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize, w2_small_tmp,
-                   o_grouped_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
-                   h_counts[i], kHiddenSize, kIntermediateSize, stream);
+        if (h_counts[i] < kGroupedGemm2Threshold)
+        {
+          if (profile_enabled)
+          {
+            ++profile.small_gemm2_experts;
+          }
+          dequant_weights_to_f32_kernel<<<
+              (static_cast<int64_t>(kHiddenSize) * kIntermediateSize + 255) / 256, 256, 0,
+              stream>>>(static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()) +
+                            static_cast<int64_t>(i) * kHiddenSize * kIntermediateSize,
+                        static_cast<const float *>(gemm2_weights_scale.data_ptr()) +
+                            static_cast<int64_t>(i) * (kHiddenSize / kBlock) *
+                                (kIntermediateSize / kBlock),
+                        w2_small_tmp, 1, kHiddenSize, kIntermediateSize);
+          CHECK_CUDA(cudaGetLastError());
+          RunGemmF32(c_f32 + static_cast<int64_t>(h_offsets[i]) * kIntermediateSize, w2_small_tmp,
+                     o_grouped_f32 + static_cast<int64_t>(h_offsets[i]) * kHiddenSize,
+                     h_counts[i], kHiddenSize, kIntermediateSize, stream);
+        }
       }
     }
     if (profile_enabled)
@@ -1773,10 +1993,11 @@ namespace
       CHECK_CUDA(cudaMemcpyAsync(d_grouped_experts2, grouped_gemm2.experts.data(),
                                  grouped_gemm2.experts.size() * sizeof(int32_t),
                                  cudaMemcpyHostToDevice, stream));
-      int64_t grouped_gemm2_values = static_cast<int64_t>(grouped_gemm2.experts.size()) *
-                                     kHiddenSize * kIntermediateSize;
-      dequant_selected_experts_to_f32_kernel<<<(grouped_gemm2_values + 255) / 256, 256, 0,
-                                               stream>>>(
+      dim3 dequant_grid(static_cast<unsigned int>(kIntermediateSize / kBlock),
+                         static_cast<unsigned int>(kHiddenSize / kBlock),
+                         static_cast<unsigned int>(grouped_gemm2.experts.size()));
+      dequant_selected_experts_blocks_to_f32_kernel<<<dequant_grid, kSelectedDequantThreads, 0,
+                                                      stream>>>(
           d_grouped_experts2, static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
           static_cast<const float *>(gemm2_weights_scale.data_ptr()), w2_grouped_f32,
           static_cast<int32_t>(grouped_gemm2.experts.size()), kHiddenSize, kIntermediateSize);
