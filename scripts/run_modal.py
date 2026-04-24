@@ -11,6 +11,7 @@ Setup (one-time):
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +49,30 @@ image = (
 )
 
 
+def parse_workload_uuid_list(arg: str) -> list[str]:
+    """Parse a comma-separated workload UUID list."""
+    if not arg:
+        return []
+    uuids = []
+    for item in arg.replace("\n", ",").split(","):
+        item = item.strip()
+        if item:
+            uuids.append(item)
+    return uuids
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    """Deduplicate workload UUIDs while preserving order."""
+    seen = set()
+    result = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
 @app.function(
     image=image,
     gpu="B200:1",
@@ -60,10 +85,16 @@ def run_benchmark(
     config: BenchmarkConfig = None,
     max_workloads: int = 0,
     workload_uuid: str = "",
+    kernel_profile: bool = False,
 ) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    debug_mode = kernel_profile
+    profile_path = ""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        if debug_mode:
+            config = BenchmarkConfig(warmup_runs=0, iterations=1, num_trials=1)
+        else:
+            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     def get_workload_uuid(item) -> str | None:
         if hasattr(item, "uuid"):
@@ -72,6 +103,16 @@ def run_benchmark(
         if workload is not None and hasattr(workload, "uuid"):
             return workload.uuid
         return None
+
+    if kernel_profile:
+        os.environ["FUSED_MOE_PROFILE"] = "1"
+        workload_label = workload_uuid or "all"
+        profile_path = f"/tmp/fused_moe_profile_{workload_label}.log"
+        Path(profile_path).write_text("")
+        os.environ["FUSED_MOE_PROFILE_PATH"] = profile_path
+    else:
+        os.environ.pop("FUSED_MOE_PROFILE", None)
+        os.environ.pop("FUSED_MOE_PROFILE_PATH", None)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -103,6 +144,12 @@ def run_benchmark(
     benchmark = Benchmark(bench_trace_set, config)
     result_trace_set = benchmark.run_all(dump_traces=True)
 
+    kernel_profile_log = ""
+    if kernel_profile and profile_path:
+        profile_file = Path(profile_path)
+        if profile_file.exists():
+            kernel_profile_log = profile_file.read_text()
+
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
 
@@ -114,6 +161,11 @@ def run_benchmark(
             }
             if trace.evaluation.log:
                 entry["log"] = trace.evaluation.log
+            if kernel_profile_log:
+                if entry.get("log"):
+                    entry["log"] = f"{entry['log'].rstrip()}\n{kernel_profile_log}"
+                else:
+                    entry["log"] = kernel_profile_log
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
                 entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
@@ -131,7 +183,7 @@ def run_benchmark(
 
 
 
-def print_results(results: dict):
+def print_results(results: dict, show_logs: bool = False):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
@@ -152,7 +204,7 @@ def print_results(results: dict):
 
             print()
 
-            if result.get("log") and status != "SUCCESS":
+            if result.get("log") and (show_logs or status != "SUCCESS"):
                 print("    log:")
                 for line in result["log"].strip().splitlines():
                     print(f"      {line}")
@@ -162,6 +214,8 @@ def print_results(results: dict):
 def main(
     max_workloads: int = 0,
     workload_uuid: str = "",
+    workload_uuids: str = "",
+    kernel_profile: bool = False,
     json_out: str = "",
 ):
     """Pack solution and run benchmark on Modal."""
@@ -177,11 +231,20 @@ def main(
     print("\nRunning benchmark on Modal B200...")
     if max_workloads > 0:
         print(f"Limiting run to {max_workloads} workload(s)")
-    if workload_uuid:
-        print(f"Filtering to workload: {workload_uuid}")
+    requested_workload_uuids = dedupe_preserve_order(
+        [item for item in [workload_uuid, *parse_workload_uuid_list(workload_uuids)] if item]
+    )
+    if requested_workload_uuids:
+        print("Filtering to workload(s):")
+        for item in requested_workload_uuids:
+            print(f"  - {item}")
+    if kernel_profile:
+        print("Kernel profiling enabled via FUSED_MOE_PROFILE=1")
+        print("Using reduced benchmark config for diagnostics: warmup=0, iterations=1, trials=1")
+
     workload_uuids: list[str]
-    if workload_uuid:
-        workload_uuids = [workload_uuid]
+    if requested_workload_uuids:
+        workload_uuids = requested_workload_uuids
     else:
         workload_file = (
             PROJECT_ROOT.parent
@@ -213,6 +276,7 @@ def main(
         [None] * len(workload_uuids),
         [0] * len(workload_uuids),
         workload_uuids,
+        [kernel_profile] * len(workload_uuids),
     ):
         if not res:
             continue
@@ -225,7 +289,7 @@ def main(
         print("No results returned!")
         return
 
-    print_results(results)
+    print_results(results, show_logs=kernel_profile)
     if json_out:
         output_path = Path(json_out)
         output_path.parent.mkdir(parents=True, exist_ok=True)
