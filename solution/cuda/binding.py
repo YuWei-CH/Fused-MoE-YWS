@@ -1,9 +1,8 @@
-"""TVM FFI binding that lazily builds and dispatches the naive MoE CUDA extension."""
+"""TVM FFI binding that lazily builds and dispatches the MoE CUDA extension."""
 
 from __future__ import annotations
 
 import hashlib
-import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,29 +20,19 @@ SOURCE_PATHS = tuple(
 )
 
 
-def _env_flag(name: str) -> bool:
-    value = os.getenv(name, "")
-    return value.lower() not in ("", "0", "false", "off", "no")
-
-
-def _cuda_cflags(profile_enabled: bool) -> list[str]:
-    flags = [
+def _cuda_cflags() -> list[str]:
+    return [
         "-O3",
         "--use_fast_math",
         "-std=c++21",
-        "-lineinfo",
-        # "-gencode=arch=compute_90,code=sm_90",
         "-gencode=arch=compute_100,code=sm_100",
     ]
-    if profile_enabled:
-        flags.append("-DFUSED_MOE_PROFILE=1")
-    return flags
+
 
 # Hash-based JIT extension loading.
-@lru_cache(maxsize=2)
-def _load_extension(profile_enabled: bool):
+@lru_cache(maxsize=1)
+def _load_extension():
     hasher = hashlib.sha1()
-    hasher.update(f"profile={int(profile_enabled)}".encode())
     for path in SOURCE_PATHS:
         hasher.update(str(path.relative_to(THIS_DIR)).encode())
         hasher.update(path.read_bytes())
@@ -52,7 +41,7 @@ def _load_extension(profile_enabled: bool):
     return load(
         name=module_name,
         sources=[str(KERNEL_PATH)],
-        extra_cuda_cflags=_cuda_cflags(profile_enabled),
+        extra_cuda_cflags=_cuda_cflags(),
         verbose=False,
     )
 
@@ -70,7 +59,7 @@ def kernel(
     local_expert_offset: int,
     routed_scaling_factor: float,
 ):
-    return _load_extension(_env_flag("FUSED_MOE_PROFILE")).kernel(
+    return _load_extension().kernel(
         routing_logits,
         routing_bias,
         hidden_states,

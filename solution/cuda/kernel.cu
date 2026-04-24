@@ -15,11 +15,8 @@
 #include <tvm/ffi/function.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstdio>
 #include <vector>
 
 namespace ffi = tvm::ffi;
@@ -71,235 +68,6 @@ namespace
       TVM_FFI_THROW(RuntimeError) << "CUTLASS error in " << context << ": "
                                   << cutlassGetStatusString(status);
     }
-  }
-
-  class GpuStageTimer
-  {
-  public:
-    explicit GpuStageTimer(const char *stage_name) : stage_name_(stage_name)
-    {
-      CHECK_CUDA(cudaEventCreate(&start_));
-      CHECK_CUDA(cudaEventCreate(&end_));
-    }
-
-    ~GpuStageTimer()
-    {
-      if (start_ != nullptr)
-      {
-        cudaError_t err = cudaEventDestroy(start_);
-        (void)err;
-      }
-      if (end_ != nullptr)
-      {
-        cudaError_t err = cudaEventDestroy(end_);
-        (void)err;
-      }
-    }
-
-    GpuStageTimer(const GpuStageTimer &) = delete;
-    GpuStageTimer &operator=(const GpuStageTimer &) = delete;
-
-    void Start(cudaStream_t stream)
-    {
-      has_start_ = true;
-      CHECK_CUDA(cudaEventRecord(start_, stream));
-    }
-    void Stop(cudaStream_t stream)
-    {
-      has_end_ = true;
-      CHECK_CUDA(cudaEventRecord(end_, stream));
-    }
-
-    float ElapsedMs() const
-    {
-      if (!has_start_ || !has_end_)
-      {
-        return 0.0f;
-      }
-      float ms = 0.0f;
-      CHECK_CUDA(cudaEventElapsedTime(&ms, start_, end_));
-      return ms;
-    }
-
-    const char *name() const { return stage_name_; }
-
-  private:
-    const char *stage_name_ = nullptr;
-    cudaEvent_t start_ = nullptr;
-    cudaEvent_t end_ = nullptr;
-    bool has_start_ = false;
-    bool has_end_ = false;
-  };
-
-  class CpuWallTimer
-  {
-  public:
-    using Clock = std::chrono::steady_clock;
-
-    void Start() { start_ = Clock::now(); }
-
-    double Stop()
-    {
-      elapsed_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - start_).count();
-      return elapsed_ms_;
-    }
-
-    double ElapsedMs() const { return elapsed_ms_; }
-
-  private:
-    Clock::time_point start_{};
-    double elapsed_ms_ = 0.0;
-  };
-
-  struct DeviceOnlyPipelineProfile
-  {
-    DeviceOnlyPipelineProfile()
-        : prepare("prepare_workload"), gather("gather_dequant"), gemm1("gemm1_device_only"),
-          swiglu("swiglu"), gemm2("gemm2_device_only"), scatter("scatter")
-    {
-    }
-
-    GpuStageTimer prepare;
-    GpuStageTimer gather;
-    GpuStageTimer gemm1;
-    GpuStageTimer swiglu;
-    GpuStageTimer gemm2;
-    GpuStageTimer scatter;
-    int64_t t = 0;
-    int32_t max_rows = 0;
-    int32_t total_rows = 0;
-    double pipeline_wall_ms = 0.0;
-  };
-
-  struct GroupedWorkloadPipelineProfile
-  {
-    GroupedWorkloadPipelineProfile()
-        : prepare("prepare_workload"), gather("gather_dequant"),
-          grouped_gemm1_dequant("dequant_grouped_gemm1_weights"),
-          gemm1_small("gemm1_small_simt"), gemm1_grouped("gemm1_grouped_cutlass_tc"),
-          swiglu("swiglu"), grouped_gemm2_dequant("dequant_grouped_gemm2_weights"),
-          gemm2_small("gemm2_small_simt"), gemm2_grouped("gemm2_grouped_cutlass_tc"),
-          scatter("scatter")
-    {
-    }
-
-    GpuStageTimer prepare;
-    GpuStageTimer gather;
-    GpuStageTimer grouped_gemm1_dequant;
-    GpuStageTimer gemm1_small;
-    GpuStageTimer gemm1_grouped;
-    GpuStageTimer swiglu;
-    GpuStageTimer grouped_gemm2_dequant;
-    GpuStageTimer gemm2_small;
-    GpuStageTimer gemm2_grouped;
-    GpuStageTimer scatter;
-    int64_t t = 0;
-    int32_t max_rows = 0;
-    int32_t total_rows = 0;
-    int32_t grouped_gemm1_experts = 0;
-    int32_t grouped_gemm2_experts = 0;
-    int32_t small_gemm1_experts = 0;
-    int32_t small_gemm2_experts = 0;
-    double counts_d2h_ms = 0.0;
-    double host_plan_ms = 0.0;
-    double pipeline_wall_ms = 0.0;
-  };
-
-  inline bool ProfileEnabled()
-  {
-    const char *value = std::getenv("FUSED_MOE_PROFILE");
-    if (value == nullptr)
-    {
-      return false;
-    }
-    if (value[0] == '\0')
-    {
-      return false;
-    }
-    if ((value[0] == '0' && value[1] == '\0') ||
-        ((value[0] == 'f' || value[0] == 'F') && (value[1] == 'a' || value[1] == 'A')) ||
-        ((value[0] == 'n' || value[0] == 'N') && (value[1] == 'o' || value[1] == 'O')))
-    {
-      return false;
-    }
-    return true;
-  }
-
-  inline void EmitProfileLine(const char *line)
-  {
-    if (!ProfileEnabled())
-    {
-      return;
-    }
-    std::fputs(line, stdout);
-    std::fflush(stdout);
-
-    const char *path = std::getenv("FUSED_MOE_PROFILE_PATH");
-    if (path == nullptr || path[0] == '\0')
-    {
-      return;
-    }
-    if (FILE *fp = std::fopen(path, "a"))
-    {
-      std::fputs(line, fp);
-      std::fclose(fp);
-    }
-  }
-
-  inline void PrintDeviceOnlyPipelineProfile(const DeviceOnlyPipelineProfile &profile)
-  {
-    double prepare_ms = profile.prepare.ElapsedMs();
-    double gather_ms = profile.gather.ElapsedMs();
-    double gemm1_ms = profile.gemm1.ElapsedMs();
-    double swiglu_ms = profile.swiglu.ElapsedMs();
-    double gemm2_ms = profile.gemm2.ElapsedMs();
-    double scatter_ms = profile.scatter.ElapsedMs();
-    double gpu_stage_sum_ms =
-        prepare_ms + gather_ms + gemm1_ms + swiglu_ms + gemm2_ms + scatter_ms;
-    char line[512];
-    std::snprintf(
-        line, sizeof(line),
-        "[FUSED_MOE_PROFILE] path=device_only t=%lld max_rows=%d total_rows=%d "
-        "prepare_ms=%.3f gather_ms=%.3f gemm1_ms=%.3f swiglu_ms=%.3f gemm2_ms=%.3f "
-        "scatter_ms=%.3f gpu_stage_sum_ms=%.3f pipeline_wall_ms=%.3f\n",
-        static_cast<long long>(profile.t), profile.max_rows, profile.total_rows, prepare_ms,
-        gather_ms, gemm1_ms, swiglu_ms, gemm2_ms, scatter_ms, gpu_stage_sum_ms,
-        profile.pipeline_wall_ms);
-    EmitProfileLine(line);
-  }
-
-  inline void PrintGroupedWorkloadPipelineProfile(const GroupedWorkloadPipelineProfile &profile)
-  {
-    double prepare_ms = profile.prepare.ElapsedMs();
-    double gather_ms = profile.gather.ElapsedMs();
-    double grouped_gemm1_dequant_ms = profile.grouped_gemm1_dequant.ElapsedMs();
-    double gemm1_small_ms = profile.gemm1_small.ElapsedMs();
-    double gemm1_grouped_ms = profile.gemm1_grouped.ElapsedMs();
-    double swiglu_ms = profile.swiglu.ElapsedMs();
-    double grouped_gemm2_dequant_ms = profile.grouped_gemm2_dequant.ElapsedMs();
-    double gemm2_small_ms = profile.gemm2_small.ElapsedMs();
-    double gemm2_grouped_ms = profile.gemm2_grouped.ElapsedMs();
-    double scatter_ms = profile.scatter.ElapsedMs();
-    double gpu_stage_sum_ms =
-        prepare_ms + gather_ms + grouped_gemm1_dequant_ms + gemm1_small_ms + gemm1_grouped_ms +
-        swiglu_ms + grouped_gemm2_dequant_ms + gemm2_small_ms + gemm2_grouped_ms + scatter_ms;
-    char line[1024];
-    std::snprintf(
-        line, sizeof(line),
-        "[FUSED_MOE_PROFILE] path=grouped_workload t=%lld max_rows=%d total_rows=%d "
-        "grouped_gemm1_experts=%d small_gemm1_experts=%d grouped_gemm2_experts=%d "
-        "small_gemm2_experts=%d prepare_ms=%.3f counts_d2h_ms=%.3f host_plan_ms=%.3f "
-        "gather_ms=%.3f dequant_grouped_gemm1_ms=%.3f gemm1_small_ms=%.3f "
-        "gemm1_cutlass_tc_ms=%.3f swiglu_ms=%.3f dequant_grouped_gemm2_ms=%.3f "
-        "gemm2_small_ms=%.3f gemm2_cutlass_tc_ms=%.3f scatter_ms=%.3f gpu_stage_sum_ms=%.3f "
-        "pipeline_wall_ms=%.3f\n",
-        static_cast<long long>(profile.t), profile.max_rows, profile.total_rows,
-        profile.grouped_gemm1_experts, profile.small_gemm1_experts,
-        profile.grouped_gemm2_experts, profile.small_gemm2_experts, prepare_ms,
-        profile.counts_d2h_ms, profile.host_plan_ms, gather_ms, grouped_gemm1_dequant_ms,
-        gemm1_small_ms, gemm1_grouped_ms, swiglu_ms, grouped_gemm2_dequant_ms, gemm2_small_ms,
-        gemm2_grouped_ms, scatter_ms, gpu_stage_sum_ms, profile.pipeline_wall_ms);
-    EmitProfileLine(line);
   }
 
   namespace cutlass_grouped_f32
@@ -636,7 +404,7 @@ namespace
   // top-2 per group -> top-4 groups -> final top-8 experts -> normalized weights from s.
   // routing_logits is FP32
   // Output: topk_idx [t, 8], weights [t, kGlobalExperts]. 8 expert for the token and their weights.
-  // TODO: One block process more tokens
+  // One block processes one token and selects the local top-k experts.
   __global__ void routing_select_kernel(const float *s, const float *s_with_bias, int32_t *topk_idx,
                                         float *weights, int64_t t,
                                         float routed_scaling_factor)
@@ -1689,32 +1457,15 @@ namespace
     // keep all scheduling on device and run both GEMMs with the custom FP8 kernels.
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
-    bool profile_enabled = ProfileEnabled();
-    CpuWallTimer pipeline_timer;
-    DeviceOnlyPipelineProfile profile;
-    if (profile_enabled)
-    {
-      pipeline_timer.Start();
-      profile.t = t;
-      profile.max_rows = max_rows;
-    }
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
     size_t workspace_bytes = GetDeviceOnlyWorkspaceBytes(max_rows, scan_workspace_size);
     static thread_local CachedDeviceBuffer<uint8_t> device_only_workspace_cache;
     WorkspaceArena workspace(device_only_workspace_cache.get(workspace_bytes), workspace_bytes);
 
     // Step 1. Build the expert-major row layout for all local assignments.
-    if (profile_enabled)
-    {
-      profile.prepare.Start(stream);
-    }
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &workspace, stream, false);
-    if (profile_enabled)
-    {
-      profile.prepare.Stop(stream);
-    }
     // The workspace packs:
     // counts/offsets/reordered rows + A + G1 + C + O for the full local assignment set.
     float *a_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
@@ -1723,76 +1474,34 @@ namespace
     float *o_f32 = workspace.Alloc<float>(static_cast<size_t>(max_rows) * kHiddenSize);
 
     // Step 2. Gather the routed token rows and dequantize activations to FP32.
-    if (profile_enabled)
-    {
-      profile.gather.Start(stream);
-    }
     fused_gather_dequant_f32_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                       256, 0, stream>>>(
         static_cast<const __nv_fp8_e4m3 *>(hidden_states.data_ptr()), prepared.reordered_tokens,
         static_cast<const float *>(hidden_states_scale.data_ptr()), a_f32, max_rows, scale_t);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.gather.Stop(stream);
-    }
 
     // Step 3. Run the two expert projections with the custom device-only FP8 kernels.
-    if (profile_enabled)
-    {
-      profile.gemm1.Start(stream);
-    }
     LaunchGroupedFp8Gemm1<kGemm1TileM, kGemm1TileN, kGemm1TileK>(
         a_f32, prepared.expert_offsets, prepared.expert_counts,
         static_cast<const __nv_fp8_e4m3 *>(gemm1_weights.data_ptr()),
         static_cast<const float *>(gemm1_weights_scale.data_ptr()), g1_f32, stream);
-    if (profile_enabled)
-    {
-      profile.gemm1.Stop(stream);
-    }
 
     // Step 4. Apply SwiGLU between the two projections.
-    if (profile_enabled)
-    {
-      profile.swiglu.Start(stream);
-    }
     swiglu_f32_kernel<<<(static_cast<int64_t>(max_rows) * kIntermediateSize + 255) / 256,
                         256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.swiglu.Stop(stream);
-      profile.gemm2.Start(stream);
-    }
 
     LaunchGroupedFp8Gemm2<kGemm2TileM, kGemm2TileN, kGemm2TileK>(
         c_f32, prepared.expert_offsets, prepared.expert_counts,
         static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()),
         static_cast<const float *>(gemm2_weights_scale.data_ptr()), o_f32, stream);
-    if (profile_enabled)
-    {
-      profile.gemm2.Stop(stream);
-    }
 
     // Step 5. Scatter the reordered expert rows back into token-major output order.
-    if (profile_enabled)
-    {
-      profile.scatter.Start(stream);
-    }
     optimized_scatter_add_kernel<<<(static_cast<int64_t>(max_rows) * kHiddenSize + 255) / 256,
                                    256, 0, stream>>>(
         o_f32, prepared.reordered_tokens, prepared.reordered_local_experts, weights,
         output_fp32, prepared.total_rows, local_expert_offset);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.scatter.Stop(stream);
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-      profile.pipeline_wall_ms = pipeline_timer.Stop();
-      CHECK_CUDA(cudaMemcpy(&profile.total_rows, prepared.total_rows, sizeof(int32_t),
-                            cudaMemcpyDeviceToHost));
-      PrintDeviceOnlyPipelineProfile(profile);
-    }
   }
 
   void RunGroupedWorkloadPipeline(
@@ -1806,15 +1515,6 @@ namespace
     // non-empty experts through dequantization plus CUTLASS TensorOp grouped GEMM.
     int64_t scale_t = hidden_states_scale.size(1);
     int32_t max_rows = static_cast<int32_t>(t * kTopK);
-    bool profile_enabled = ProfileEnabled();
-    CpuWallTimer pipeline_timer;
-    GroupedWorkloadPipelineProfile profile;
-    if (profile_enabled)
-    {
-      pipeline_timer.Start();
-      profile.t = t;
-      profile.max_rows = max_rows;
-    }
     size_t scan_workspace_size = GetExpertScanWorkspaceSize(stream);
     size_t prep_workspace_bytes = GetGroupedPrepWorkspaceBytes(max_rows, scan_workspace_size);
     static thread_local CachedDeviceBuffer<uint8_t> grouped_prep_workspace_cache;
@@ -1822,26 +1522,13 @@ namespace
                                   prep_workspace_bytes);
 
     // Step 1. Build the shared expert-major row layout.
-    if (profile_enabled)
-    {
-      profile.prepare.Start(stream);
-    }
     PreparedExpertWorkload prepared =
         PrepareExpertWorkload(topk_idx, t, local_expert_offset, max_rows, scan_workspace_size,
                               &prep_workspace, stream, true);
-    if (profile_enabled)
-    {
-      profile.prepare.Stop(stream);
-    }
 
     // Step 2. Copy only the per-expert row counts to pinned host memory on a side stream.
     // The host classifies experts into the small and tensor-core paths while activation
     // gather/dequantization runs on the main stream.
-    CpuWallTimer counts_d2h_timer;
-    if (profile_enabled)
-    {
-      counts_d2h_timer.Start();
-    }
     cudaEvent_t workload_ready_event = nullptr;
     cudaStream_t host_copy_stream = nullptr;
     CHECK_CUDA(cudaEventCreateWithFlags(&workload_ready_event, cudaEventDisableTiming));
@@ -1857,12 +1544,6 @@ namespace
     CHECK_CUDA(cudaStreamSynchronize(host_copy_stream));
     CHECK_CUDA(cudaEventDestroy(workload_ready_event));
     CHECK_CUDA(cudaStreamDestroy(host_copy_stream));
-    CpuWallTimer host_plan_timer;
-    if (profile_enabled)
-    {
-      profile.counts_d2h_ms = counts_d2h_timer.Stop();
-      host_plan_timer.Start();
-    }
 
     std::vector<int32_t> h_counts(kLocalExperts);
     for (int32_t expert = 0; expert < kLocalExperts; ++expert)
@@ -1873,22 +1554,9 @@ namespace
     int32_t total_reordered = h_offsets[kLocalExperts];
     GroupedExpertPlan grouped_gemm1 = BuildGroupedExpertPlan(h_counts, kGroupedGemm1Threshold);
     GroupedExpertPlan grouped_gemm2 = BuildGroupedExpertPlan(h_counts, kGroupedGemm2Threshold);
-    if (profile_enabled)
-    {
-      profile.host_plan_ms = host_plan_timer.Stop();
-      profile.total_rows = total_reordered;
-      profile.grouped_gemm1_experts = static_cast<int32_t>(grouped_gemm1.experts.size());
-      profile.grouped_gemm2_experts = static_cast<int32_t>(grouped_gemm2.experts.size());
-    }
 
     if (total_reordered == 0)
     {
-      if (profile_enabled)
-      {
-        CHECK_CUDA(cudaStreamSynchronize(stream));
-        profile.pipeline_wall_ms = pipeline_timer.Stop();
-        PrintGroupedWorkloadPipelineProfile(profile);
-      }
       return;
     }
 
@@ -1898,10 +1566,6 @@ namespace
     static thread_local CachedDeviceBuffer<cutlass::half_t> grouped_a_cache;
     cutlass::half_t *a_f16 =
         grouped_a_cache.get(static_cast<size_t>(total_reordered) * kHiddenSize);
-    if (profile_enabled)
-    {
-      profile.gather.Start(stream);
-    }
     fused_gather_dequant_f16_kernel<<<
         ((static_cast<int64_t>(total_reordered) * kHiddenSize) / 4 + 255) / 256, 256, 0,
         stream>>>(
@@ -1909,10 +1573,6 @@ namespace
         static_cast<const float *>(hidden_states_scale.data_ptr()), a_f16, total_reordered,
         scale_t);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.gather.Stop(stream);
-    }
 
     size_t compute_workspace_bytes = GetGroupedComputeWorkspaceBytes(
         total_reordered, grouped_gemm1.experts.size(), grouped_gemm2.experts.size());
@@ -1944,10 +1604,6 @@ namespace
 
     // Step 5. Execute GEMM1. The SIMT fallback remains compiled for higher thresholds, but the
     // current threshold sends every non-empty expert to compact dequant + CUTLASS TC.
-    if (profile_enabled)
-    {
-      profile.gemm1_small.Start(stream);
-    }
     if constexpr (kGroupedGemm1Threshold > 1)
     {
       for (int i = 0; i < kLocalExperts; ++i)
@@ -1958,10 +1614,6 @@ namespace
         }
         if (h_counts[i] < kGroupedGemm1Threshold)
         {
-          if (profile_enabled)
-          {
-            ++profile.small_gemm1_experts;
-          }
           // Small expert: materialize just one expert's weights and run the SIMT fallback.
           dequant_weights_to_f32_kernel<<<
               (static_cast<int64_t>(2 * kIntermediateSize) * kHiddenSize + 255) / 256, 256, 0,
@@ -1977,11 +1629,6 @@ namespace
                      h_counts[i], 2 * kIntermediateSize, kHiddenSize, stream);
         }
       }
-    }
-    if (profile_enabled)
-    {
-      profile.gemm1_small.Stop(stream);
-      profile.grouped_gemm1_dequant.Start(stream);
     }
 
     if (!grouped_gemm1.experts.empty())
@@ -2000,11 +1647,6 @@ namespace
           kHiddenSize);
       CHECK_CUDA(cudaGetLastError());
     }
-    if (profile_enabled)
-    {
-      profile.grouped_gemm1_dequant.Stop(stream);
-      profile.gemm1_grouped.Start(stream);
-    }
 
     if (!grouped_gemm1.experts.empty())
     {
@@ -2012,29 +1654,13 @@ namespace
                                 w13_grouped_f16, 2 * kIntermediateSize * kHiddenSize, g1_f32,
                                 2 * kIntermediateSize, 2 * kIntermediateSize, kHiddenSize, stream);
     }
-    if (profile_enabled)
-    {
-      profile.gemm1_grouped.Stop(stream);
-    }
 
     // Step 6. Apply SwiGLU after GEMM1 completes for all reordered rows.
-    if (profile_enabled)
-    {
-      profile.swiglu.Start(stream);
-    }
     swiglu_f32_kernel<<<(static_cast<int64_t>(total_reordered) * kIntermediateSize + 255) / 256,
                         256, 0, stream>>>(g1_f32, c_f32, prepared.total_rows);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.swiglu.Stop(stream);
-    }
 
     // Step 7. Execute GEMM2 with the same grouped-expert policy.
-    if (profile_enabled)
-    {
-      profile.gemm2_small.Start(stream);
-    }
     if constexpr (kGroupedGemm2Threshold > 1)
     {
       for (int i = 0; i < kLocalExperts; ++i)
@@ -2045,10 +1671,6 @@ namespace
         }
         if (h_counts[i] < kGroupedGemm2Threshold)
         {
-          if (profile_enabled)
-          {
-            ++profile.small_gemm2_experts;
-          }
           dequant_weights_to_f32_kernel<<<
               (static_cast<int64_t>(kHiddenSize) * kIntermediateSize + 255) / 256, 256, 0,
               stream>>>(static_cast<const __nv_fp8_e4m3 *>(gemm2_weights.data_ptr()) +
@@ -2063,11 +1685,6 @@ namespace
                      h_counts[i], kHiddenSize, kIntermediateSize, stream);
         }
       }
-    }
-    if (profile_enabled)
-    {
-      profile.gemm2_small.Stop(stream);
-      profile.grouped_gemm2_dequant.Start(stream);
     }
 
     if (!grouped_gemm2.experts.empty())
@@ -2085,11 +1702,6 @@ namespace
           static_cast<int32_t>(grouped_gemm2.experts.size()), kHiddenSize, kIntermediateSize);
       CHECK_CUDA(cudaGetLastError());
     }
-    if (profile_enabled)
-    {
-      profile.grouped_gemm2_dequant.Stop(stream);
-      profile.gemm2_grouped.Start(stream);
-    }
 
     if (!grouped_gemm2.experts.empty())
     {
@@ -2098,28 +1710,13 @@ namespace
                                 kHiddenSize * kIntermediateSize, o_grouped_f32, kHiddenSize,
                                 kHiddenSize, kIntermediateSize, stream);
     }
-    if (profile_enabled)
-    {
-      profile.gemm2_grouped.Stop(stream);
-    }
 
     // Step 8. Reduce each token's local routed rows and cast directly to the final BF16 output.
-    if (profile_enabled)
-    {
-      profile.scatter.Start(stream);
-    }
     final_reduce_cast_grouped_kernel<<<(static_cast<int64_t>(t) * kHiddenSize + 255) / 256, 256,
                                        0, stream>>>(
         o_grouped_f32, prepared.token_route_counts, prepared.token_route_rows,
         prepared.token_route_experts, weights, output_bf16, t);
     CHECK_CUDA(cudaGetLastError());
-    if (profile_enabled)
-    {
-      profile.scatter.Stop(stream);
-      CHECK_CUDA(cudaStreamSynchronize(stream));
-      profile.pipeline_wall_ms = pipeline_timer.Stop();
-      PrintGroupedWorkloadPipelineProfile(profile);
-    }
   }
 
 } // namespace
